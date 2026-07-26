@@ -7,3 +7,5 @@ gnss_pos/
 *.o
 *.oct
 *.npy
+sdr_list.txt
+panadapter.conf
