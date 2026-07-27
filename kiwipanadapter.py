@@ -468,6 +468,7 @@ class PanadapterApp:
         self._last_signal_dbm = None
         self._smeter_dbm = None
         self._smeter_last_ts = None
+        self._marker_line_id = None
         self._last_start = None
         self._last_stop = None
         self._kiwiclientd_proc = None
@@ -700,6 +701,7 @@ class PanadapterApp:
 
         if self._last_start is not None:
             self._draw_freq_axis(self._last_start, self._last_stop)
+            self._draw_freq_marker(self._last_start, self._last_stop, canvas_w, canvas_h)
 
     def _draw_freq_axis(self, start_khz, stop_khz):
         # Axis sits above the waterfall, so ticks point down toward it (at
@@ -721,6 +723,32 @@ class PanadapterApp:
             x = int((f - start_khz) / span * w)
             c.create_line(x, h, x, h - 6, fill='#a0a0a0')
             c.create_text(x, h - 7, text=label_fmt % f, fill='white', anchor='s', font=('TkFixedFont', 7))
+
+        with self._freq_lock:
+            freq = self._current_freq_khz
+        if freq is not None and start_khz <= freq <= stop_khz:
+            x = int((freq - start_khz) / span * w)
+            c.create_line(x, 0, x, h, fill='#ff00ff', width=1)
+
+    def _draw_freq_marker(self, start_khz, stop_khz, canvas_w, canvas_h):
+        # Vertical marker on the waterfall itself at the FreeDV/rigctl-reported
+        # frequency -- normally coincides with the centre (the waterfall follows
+        # it live) but pinpoints the exact value even during retune lag, useful
+        # for comparing against a known-frequency signal (e.g. a CW test tone).
+        span = stop_khz - start_khz
+        with self._freq_lock:
+            freq = self._current_freq_khz
+        if freq is None or span <= 0 or not (start_khz <= freq <= stop_khz):
+            if self._marker_line_id is not None:
+                self._canvas.delete(self._marker_line_id)
+                self._marker_line_id = None
+            return
+        x = int((freq - start_khz) / span * canvas_w)
+        if self._marker_line_id is None:
+            self._marker_line_id = self._canvas.create_line(
+                x, 0, x, canvas_h, fill='#ff00ff', dash=(4, 2))
+        else:
+            self._canvas.coords(self._marker_line_id, x, 0, x, canvas_h)
 
     def _draw_smeter(self, dbm):
         c = self._smeter_canvas
