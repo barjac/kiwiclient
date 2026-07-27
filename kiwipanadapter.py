@@ -326,7 +326,7 @@ class LiveWFStream(KiwiSDRStream):
             'dbm': dbm,
             'start': center - self._span_khz / 2,
             'stop': center + self._span_khz / 2,
-            'center': self._freq,
+            'center': center,
         }
         try:
             self._row_queue.put_nowait(row)
