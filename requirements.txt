@@ -1,0 +1,10 @@
+# Dependencies for kiwipanadapter.py and kiwiclientd.py.
+#
+# Prefer installing via your distro's package manager where available
+# (e.g. `urpmi python3-numpy` on Mageia); use `pip3 install --user -r
+# requirements.txt` for anything not packaged by your distro.
+#
+# tkinter is NOT listed here -- it's a system package, not installable via
+# pip (e.g. `urpmi python3-tkinter` / `python3-tk` depending on distro).
+numpy
+soundcard
