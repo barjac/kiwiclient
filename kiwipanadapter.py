@@ -534,6 +534,8 @@ class PanadapterApp:
         self._canvas.pack(side='top', fill='both', expand=True)
         self._image_id = self._canvas.create_image(0, 0, anchor='nw')
         self._canvas.bind('<Configure>', self._on_resize)
+        self._sensitivity_var = tk.StringVar(value='Normal')
+        self._canvas.bind('<Button-3>', self._show_sensitivity_menu)
 
     # -- SDR connection management -------------------------------------------------
 
@@ -680,6 +682,33 @@ class PanadapterApp:
         self._last_signal_dbm = self._smeter_dbm
 
     def _on_resize(self, _event):
+        self._redraw()
+
+    def _sensitivity_presets(self):
+        # Presets are offsets from the configured mindb/maxdb (the "Normal"
+        # baseline), not absolute dBm, so they stay sensible regardless of a
+        # given SDR/antenna's actual gain chain.
+        base_min, base_max = self._options.mindb, self._options.maxdb
+        return [
+            ('Low (strong signals)', base_min + 20, base_max + 20),
+            ('Normal', base_min, base_max),
+            ('High (quiet bands)', base_min - 20, base_max - 20),
+        ]
+
+    def _show_sensitivity_menu(self, event):
+        menu = tk.Menu(self._root, tearoff=0)
+        for label, mindb, maxdb in self._sensitivity_presets():
+            menu.add_radiobutton(
+                label=label, variable=self._sensitivity_var, value=label,
+                command=lambda mn=mindb, mx=maxdb: self._set_sensitivity(mn, mx))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _set_sensitivity(self, mindb, maxdb):
+        self._mindb = mindb
+        self._maxdb = maxdb
         self._redraw()
 
     def _redraw(self):
