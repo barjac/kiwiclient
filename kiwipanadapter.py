@@ -35,6 +35,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SDR_LIST = os.path.join(SCRIPT_DIR, 'sdr_list.txt')
 DEFAULT_CONFIG = os.path.join(SCRIPT_DIR, 'panadapter.conf')
 WF_NATIVE_BINS = 1024   # matches Kiwi's fixed waterfall bin count -- native buffer width
+MAX_FREQ_KHZ = 30000.0  # Kiwi's full tunable range; zoom 0 spans this whole width
 MAX_HISTORY_ROWS = 600  # native buffer height (scrollback); displayed height can be less or more
 DEFAULT_WINDOW_HEIGHT = 300
 WF_CAL = -13           # typical Kiwi waterfall calibration offset, dB
@@ -64,12 +65,18 @@ CONFIG_SCHEMA = {
 }
 
 
-def zoom_for_span(span_khz, max_freq_khz=30000.0, max_zoom=14):
+def zoom_for_span(span_khz, max_freq_khz=MAX_FREQ_KHZ, max_zoom=14):
     """Largest (most zoomed-in) Kiwi zoom level whose span still covers span_khz."""
     for z in range(max_zoom, -1, -1):
         if max_freq_khz / (2 ** z) >= span_khz:
             return z
     return 0
+
+
+def span_for_zoom(zoom, max_freq_khz=MAX_FREQ_KHZ):
+    """Actual bandwidth (kHz) the Kiwi delivers at a given zoom level -- a coarser,
+    power-of-two-quantized value that's usually wider than any requested span_khz."""
+    return max_freq_khz / (2 ** zoom)
 
 
 def nearest_resize(img, new_h, new_w):
@@ -338,6 +345,7 @@ class LiveWFStream(KiwiSDRStream):
         self._freq = initial_freq_khz
         self._span_khz = span_khz
         self._zoom = zoom_for_span(span_khz)
+        self._actual_span_khz = span_for_zoom(self._zoom)
         self._row_queue = row_queue
         self._pending_freq = None
         self._lock = threading.Lock()
@@ -371,8 +379,8 @@ class LiveWFStream(KiwiSDRStream):
         center = self._remove_freq_offset(self._freq)
         row = {
             'dbm': dbm,
-            'start': center - self._span_khz / 2,
-            'stop': center + self._span_khz / 2,
+            'start': center - self._actual_span_khz / 2,
+            'stop': center + self._actual_span_khz / 2,
             'center': center,
         }
         try:
