@@ -39,6 +39,10 @@ MAX_HISTORY_ROWS = 600  # native buffer height (scrollback); displayed height ca
 DEFAULT_WINDOW_HEIGHT = 300
 WF_CAL = -13           # typical Kiwi waterfall calibration offset, dB
 
+def parse_bool(val):
+    return val.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 # Adjustable settings that live in the flat text config file, with their types
 CONFIG_SCHEMA = {
     'span_khz': float,
@@ -53,6 +57,7 @@ CONFIG_SCHEMA = {
     'window_height': int,
     'kiwiclientd_path': str,
     'kiwiclientd_args': str,
+    'no_kiwiclientd': parse_bool,
 }
 
 
@@ -822,7 +827,10 @@ def parse_args():
     p.add_argument('--kiwiclientd-args', dest='kiwiclientd_args', default=cfg.get('kiwiclientd_args', ''),
                     help='extra arguments appended to the managed kiwiclientd invocation, e.g. "--snddev kiwisnd0" (config: kiwiclientd_args)')
     p.add_argument('--no-kiwiclientd', dest='no_kiwiclientd', action='store_true',
-                    help="don't start/manage kiwiclientd -- use this if you're running it yourself")
+                    default=cfg.get('no_kiwiclientd', False),
+                    help="don't start/manage kiwiclientd -- use this for a real-radio setup where a "
+                         "real rigctld (config: rigctl_host/rigctl_port) is already the frequency source "
+                         "(config: no_kiwiclientd)")
     p.add_argument('--log-level', default='warn', choices=['debug', 'info', 'warn', 'error'])
     return p.parse_args()
 
