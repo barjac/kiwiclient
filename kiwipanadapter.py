@@ -55,6 +55,8 @@ CONFIG_SCHEMA = {
     'freq_major_khz': float,
     'freq_minor_khz': float,
     'window_height': int,
+    'window_x': int,
+    'window_y': int,
     'kiwiclientd_path': str,
     'kiwiclientd_args': str,
     'no_kiwiclientd': parse_bool,
@@ -541,7 +543,10 @@ class PanadapterApp:
 
     def _build_ui(self):
         screen_w = self._root.winfo_screenwidth()
-        self._root.geometry('%dx%d' % (screen_w, self._options.window_height))
+        geometry = '%dx%d' % (screen_w, self._options.window_height)
+        if self._options.window_x is not None and self._options.window_y is not None:
+            geometry += '+%d+%d' % (self._options.window_x, self._options.window_y)
+        self._root.geometry(geometry)
 
         # Fixed-height widgets (top bar, S-meter bar) must be packed to their
         # side *before* the expanding waterfall canvas, otherwise Tk's pack
@@ -836,10 +841,11 @@ class PanadapterApp:
 
     def _on_close(self):
         try:
-            height = self._root.winfo_height()
-            save_config_value(self._options.config, 'window_height', height)
+            save_config_value(self._options.config, 'window_height', self._root.winfo_height())
+            save_config_value(self._options.config, 'window_x', self._root.winfo_x())
+            save_config_value(self._options.config, 'window_y', self._root.winfo_y())
         except Exception as e:
-            logging.debug('failed to save window height: %s', e)
+            logging.debug('failed to save window geometry: %s', e)
         self._rigctl_poller.stop()
         self._stop_stream()
         self._stop_kiwiclientd()
@@ -875,6 +881,12 @@ def parse_args():
     p.add_argument('--window-height', dest='window_height', type=int,
                     default=cfg.get('window_height', DEFAULT_WINDOW_HEIGHT),
                     help='initial window height in pixels; saved back to the config on graceful exit (config: window_height)')
+    p.add_argument('--window-x', dest='window_x', type=int, default=cfg.get('window_x', None),
+                    help='initial window X position in pixels; saved back to the config on graceful exit. '
+                         'Requires a window manager that honors client-requested position -- under native Wayland this is '
+                         'typically ignored, hence GDK_BACKEND=x11/XWayland (config: window_x)')
+    p.add_argument('--window-y', dest='window_y', type=int, default=cfg.get('window_y', None),
+                    help='initial window Y position in pixels; saved back to the config on graceful exit (config: window_y)')
     p.add_argument('--sdr-list', default=DEFAULT_SDR_LIST, help='flat text file of "name host port" SDR entries')
     p.add_argument('--user', default='kiwipanadapter', help='client name reported to the Kiwi')
     p.add_argument('--default-freq', dest='default_freq', type=float, default=cfg.get('default_freq', 14200.0),
