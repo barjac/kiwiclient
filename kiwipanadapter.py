@@ -16,7 +16,9 @@ import logging
 import math
 import os
 import queue
+import shlex
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -49,6 +51,8 @@ CONFIG_SCHEMA = {
     'freq_major_khz': float,
     'freq_minor_khz': float,
     'window_height': int,
+    'kiwiclientd_path': str,
+    'kiwiclientd_args': str,
 }
 
 
@@ -218,6 +222,16 @@ def load_sdr_list(path):
     return sdrs
 
 
+def save_sdr_list(path, sdrs):
+    """Rewrite the flat 'name host port' file from an in-memory list."""
+    name_w = max((len(s['name']) for s in sdrs), default=4) + 2
+    host_w = max((len(s['host']) for s in sdrs), default=4) + 2
+    with open(path, 'w') as f:
+        f.write("# name              host                     port\n")
+        for s in sdrs:
+            f.write("%-*s %-*s %s\n" % (name_w, s['name'], host_w, s['host'], s['port']))
+
+
 class RigctlPoller(threading.Thread):
     """Polls a kiwiclientd rigctld TCP port for the current frequency, same as FreeDV does."""
 
@@ -327,6 +341,109 @@ class LiveWFStream(KiwiSDRStream):
                 pass
 
 
+class SdrEntryDialog(tk.Toplevel):
+    """Small modal form for one SDR's name/host/port. Sets self.result to a dict, or leaves it None if cancelled."""
+
+    def __init__(self, parent, entry=None):
+        super().__init__(parent)
+        self.title('SDR entry')
+        self.transient(parent)
+        self.resizable(False, False)
+        self.result = None
+
+        self._name_var = tk.StringVar(value=entry['name'] if entry else '')
+        self._host_var = tk.StringVar(value=entry['host'] if entry else '')
+        self._port_var = tk.StringVar(value=str(entry['port']) if entry else '')
+
+        form = ttk.Frame(self)
+        form.pack(padx=8, pady=8)
+        fields = [('Name:', self._name_var), ('Host:', self._host_var), ('Port:', self._port_var)]
+        for row, (label, var) in enumerate(fields):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky='e', pady=2)
+            ttk.Entry(form, textvariable=var, width=28).grid(row=row, column=1, pady=2)
+
+        btns = ttk.Frame(self)
+        btns.pack(pady=(0, 8))
+        ttk.Button(btns, text='OK', command=self._ok).pack(side='left', padx=4)
+        ttk.Button(btns, text='Cancel', command=self.destroy).pack(side='left')
+
+        self.grab_set()
+        self.wait_window(self)
+
+    def _ok(self):
+        name = self._name_var.get().strip()
+        host = self._host_var.get().strip()
+        try:
+            port = int(self._port_var.get().strip())
+        except ValueError:
+            return
+        if not name or not host:
+            return
+        self.result = {'name': name, 'host': host, 'port': port}
+        self.destroy()
+
+
+class SdrListDialog(tk.Toplevel):
+    """Add/edit/delete SDR entries; changes are written straight back to sdr_list.txt."""
+
+    def __init__(self, parent, sdr_list, list_path, on_change):
+        super().__init__(parent)
+        self.title('Manage SDRs')
+        self.transient(parent)
+        self._sdr_list = sdr_list
+        self._list_path = list_path
+        self._on_change = on_change
+
+        self._listbox = tk.Listbox(self, width=44, height=8)
+        self._listbox.pack(side='top', fill='both', expand=True, padx=8, pady=8)
+        self._refresh_listbox()
+
+        btns = ttk.Frame(self)
+        btns.pack(side='top', fill='x', padx=8, pady=(0, 8))
+        ttk.Button(btns, text='Add', command=self._add).pack(side='left')
+        ttk.Button(btns, text='Edit', command=self._edit).pack(side='left', padx=4)
+        ttk.Button(btns, text='Delete', command=self._delete).pack(side='left')
+        ttk.Button(btns, text='Close', command=self.destroy).pack(side='right')
+
+        self.grab_set()
+
+    def _refresh_listbox(self):
+        self._listbox.delete(0, 'end')
+        for s in self._sdr_list:
+            self._listbox.insert('end', '%s  (%s:%s)' % (s['name'], s['host'], s['port']))
+
+    def _save(self):
+        save_sdr_list(self._list_path, self._sdr_list)
+        self._refresh_listbox()
+        self._on_change()
+
+    def _add(self):
+        entry = SdrEntryDialog(self).result
+        if entry:
+            self._sdr_list.append(entry)
+            self._save()
+
+    def _edit(self):
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        entry = SdrEntryDialog(self, self._sdr_list[idx]).result
+        if entry:
+            self._sdr_list[idx] = entry
+            self._save()
+
+    def _delete(self):
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if len(self._sdr_list) <= 1:
+            return   # keep at least one entry
+        del self._sdr_list[idx]
+        self._save()
+
+
 class PanadapterApp:
     def __init__(self, root, options):
         self._options = options
@@ -353,15 +470,21 @@ class PanadapterApp:
         self._smeter_last_ts = None
         self._last_start = None
         self._last_stop = None
+        self._kiwiclientd_proc = None
+        self._active_sdr = None
 
         root.title('Kiwi Panadapter')
         self._build_ui()
         root.update_idletasks()   # so winfo_width/height are accurate before the first row arrives
 
+        if not self._options.no_kiwiclientd:
+            self._start_kiwiclientd(self._sdr_list[0])
+
         self._rigctl_poller = RigctlPoller(options.rigctl_host, options.rigctl_port, self._on_rigctl_freq)
         self._rigctl_poller.start()
 
         self._start_stream(self._sdr_list[0])
+        self._active_sdr = self._sdr_list[0]
         root.protocol('WM_DELETE_WINDOW', self._on_close)
         self._poll_queue()
 
@@ -378,10 +501,13 @@ class PanadapterApp:
 
         ttk.Label(top, text='SDR:').pack(side='left')
         self._sdr_var = tk.StringVar(value=self._sdr_list[0]['name'])
-        combo = ttk.Combobox(top, textvariable=self._sdr_var, state='readonly',
-                              values=[s['name'] for s in self._sdr_list])
-        combo.pack(side='left', padx=4)
-        combo.bind('<<ComboboxSelected>>', self._on_sdr_change)
+        combo_width = max((len(s['name']) for s in self._sdr_list), default=10) + 2
+        self._sdr_combo = ttk.Combobox(top, textvariable=self._sdr_var, state='readonly',
+                                        width=combo_width,
+                                        values=[s['name'] for s in self._sdr_list])
+        self._sdr_combo.pack(side='left', padx=4)
+        self._sdr_combo.bind('<<ComboboxSelected>>', self._on_sdr_change)
+        ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left')
 
         self._status_var = tk.StringVar(value='connecting...')
         ttk.Label(top, textvariable=self._status_var).pack(side='left', padx=12)
@@ -450,7 +576,55 @@ class PanadapterApp:
         self._img_buf[:] = 0
         self._smeter_dbm = None
         self._smeter_last_ts = None
+        if not self._options.no_kiwiclientd:
+            self._start_kiwiclientd(entry)
         self._start_stream(entry)
+        self._active_sdr = entry
+
+    def _open_sdr_manager(self):
+        SdrListDialog(self._root, self._sdr_list, self._options.sdr_list, self._on_sdr_list_changed)
+
+    def _on_sdr_list_changed(self):
+        names = [s['name'] for s in self._sdr_list]
+        self._sdr_combo['values'] = names
+        self._sdr_combo.config(width=max((len(n) for n in names), default=10) + 2)
+        current_name = self._sdr_var.get()
+        entry = next((s for s in self._sdr_list if s['name'] == current_name), None)
+        if entry is None and self._sdr_list:
+            entry = self._sdr_list[0]
+            self._sdr_var.set(entry['name'])
+        if entry is not None and entry != self._active_sdr:
+            self._on_sdr_change(None)
+
+    # -- kiwiclientd lifecycle --------------------------------------------------------
+
+    def _start_kiwiclientd(self, sdr_entry):
+        self._stop_kiwiclientd()
+        argv = [sys.executable, self._options.kiwiclientd_path,
+                '-s', sdr_entry['host'], '-p', str(sdr_entry['port']),
+                '--rigctl-addr', self._options.rigctl_host,
+                '--rigctl-port', str(self._options.rigctl_port),
+                '--enable-rigctl']
+        if self._options.kiwiclientd_args:
+            argv += shlex.split(self._options.kiwiclientd_args)
+        logging.info('starting kiwiclientd: %s', ' '.join(argv))
+        try:
+            self._kiwiclientd_proc = subprocess.Popen(argv, cwd=SCRIPT_DIR)
+        except Exception as e:
+            logging.error('failed to start kiwiclientd: %s', e)
+            self._kiwiclientd_proc = None
+
+    def _stop_kiwiclientd(self):
+        if self._kiwiclientd_proc is None:
+            return
+        proc = self._kiwiclientd_proc
+        self._kiwiclientd_proc = None
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
 
     # -- frequency tracking ---------------------------------------------------------
 
@@ -570,6 +744,7 @@ class PanadapterApp:
             logging.debug('failed to save window height: %s', e)
         self._rigctl_poller.stop()
         self._stop_stream()
+        self._stop_kiwiclientd()
         self._root.destroy()
 
 
@@ -606,6 +781,13 @@ def parse_args():
     p.add_argument('--user', default='kiwipanadapter', help='client name reported to the Kiwi')
     p.add_argument('--default-freq', dest='default_freq', type=float, default=cfg.get('default_freq', 14200.0),
                     help='initial center frequency (kHz) used until the first rigctl poll arrives (config: default_freq)')
+    p.add_argument('--kiwiclientd-path', dest='kiwiclientd_path',
+                    default=cfg.get('kiwiclientd_path', os.path.join(SCRIPT_DIR, 'kiwiclientd.py')),
+                    help='path to kiwiclientd.py, started/restarted automatically for the selected SDR (config: kiwiclientd_path)')
+    p.add_argument('--kiwiclientd-args', dest='kiwiclientd_args', default=cfg.get('kiwiclientd_args', ''),
+                    help='extra arguments appended to the managed kiwiclientd invocation, e.g. "--snddev kiwisnd0" (config: kiwiclientd_args)')
+    p.add_argument('--no-kiwiclientd', dest='no_kiwiclientd', action='store_true',
+                    help="don't start/manage kiwiclientd -- use this if you're running it yourself")
     p.add_argument('--log-level', default='warn', choices=['debug', 'info', 'warn', 'error'])
     return p.parse_args()
 
