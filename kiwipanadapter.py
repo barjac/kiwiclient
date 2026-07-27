@@ -58,6 +58,7 @@ CONFIG_SCHEMA = {
     'kiwiclientd_path': str,
     'kiwiclientd_args': str,
     'no_kiwiclientd': parse_bool,
+    'kiwiclientd_rigctl_port': int,
 }
 
 
@@ -238,18 +239,53 @@ def save_sdr_list(path, sdrs):
 
 
 class RigctlPoller(threading.Thread):
-    """Polls a kiwiclientd rigctld TCP port for the current frequency, same as FreeDV does."""
+    """Polls a rigctld TCP port (a real hamlib rigctld talking to an actual radio,
+    or kiwiclientd's own emulation) for the current frequency, same as FreeDV does.
 
-    def __init__(self, host, port, on_freq_khz, poll_interval=0.5):
+    If mirror_target is given (host, port) of a second rigctld -- the locally
+    managed kiwiclientd's own rigctld -- also polls mode and relays both
+    frequency and mode there as SET commands on every tick. This is how
+    kiwiclientd's SDR audio channel stays tuned to match a real radio that's
+    the actual source of truth, since kiwiclientd has no way to follow an
+    external rigctld on its own -- its only tuning input is its own local
+    rigctld port.
+    """
+
+    def __init__(self, host, port, on_freq_khz, poll_interval=0.5, mirror_target=None):
         super().__init__(daemon=True)
         self._host = host
         self._port = port
         self._on_freq_khz = on_freq_khz
         self._poll_interval = poll_interval
+        self._mirror_target = mirror_target
         self._stop_event = threading.Event()
+        self._recv_buf = ''
 
     def stop(self):
         self._stop_event.set()
+
+    def _read_line(self, sock):
+        # Proper line buffering: a single recv() can deliver more than one
+        # reply line at once (e.g. mode+passband arriving together), so
+        # leftover bytes after the first newline must be kept for the next
+        # call rather than discarded/conflated into it.
+        while '\n' not in self._recv_buf:
+            chunk = sock.recv(256)
+            if not chunk:
+                raise ConnectionError('rigctld connection closed')
+            self._recv_buf += chunk.decode('ascii', errors='ignore')
+        line, self._recv_buf = self._recv_buf.split('\n', 1)
+        return line.strip()
+
+    def _push_to_mirror(self, freq_hz, mode, passband_hz):
+        try:
+            with socket.create_connection(self._mirror_target, timeout=2) as s:
+                s.sendall(('F %d\n' % freq_hz).encode('ascii'))
+                if mode:
+                    cmd = ('M %s %d\n' % (mode, passband_hz)) if passband_hz else ('M %s\n' % mode)
+                    s.sendall(cmd.encode('ascii'))
+        except Exception as e:
+            logging.debug('rigctl mirror push failed: %s', e)
 
     def run(self):
         sock = None
@@ -259,14 +295,17 @@ class RigctlPoller(threading.Thread):
                     sock = socket.create_connection((self._host, self._port), timeout=2)
                     sock.settimeout(2)
                 sock.sendall(b'f\n')
-                buf = ''
-                while '\n' not in buf:
-                    chunk = sock.recv(256)
-                    if not chunk:
-                        raise ConnectionError('rigctld connection closed')
-                    buf += chunk.decode('ascii', errors='ignore')
-                freq_hz = float(buf.strip())
+                freq_hz = float(self._read_line(sock))
                 self._on_freq_khz(freq_hz / 1000.0)
+
+                if self._mirror_target is not None:
+                    sock.sendall(b'm\n')
+                    mode = self._read_line(sock)
+                    try:
+                        passband_hz = int(self._read_line(sock))
+                    except Exception:
+                        passband_hz = None
+                    self._push_to_mirror(freq_hz, mode, passband_hz)
             except Exception as e:
                 logging.debug('rigctl poll error: %s', e)
                 if sock is not None:
@@ -275,6 +314,7 @@ class RigctlPoller(threading.Thread):
                     except Exception:
                         pass
                 sock = None
+                self._recv_buf = ''
                 self._stop_event.wait(1.0)
                 continue
             self._stop_event.wait(self._poll_interval)
@@ -485,7 +525,13 @@ class PanadapterApp:
         if not self._options.no_kiwiclientd:
             self._start_kiwiclientd(self._sdr_list[0])
 
-        self._rigctl_poller = RigctlPoller(options.rigctl_host, options.rigctl_port, self._on_rigctl_freq)
+        mirror_target = None
+        if not self._options.no_kiwiclientd:
+            kiwiclientd_target = ('127.0.0.1', self._options.kiwiclientd_rigctl_port)
+            if (options.rigctl_host, options.rigctl_port) != kiwiclientd_target:
+                mirror_target = kiwiclientd_target
+        self._rigctl_poller = RigctlPoller(options.rigctl_host, options.rigctl_port, self._on_rigctl_freq,
+                                            mirror_target=mirror_target)
         self._rigctl_poller.start()
 
         self._start_stream(self._sdr_list[0])
@@ -607,10 +653,16 @@ class PanadapterApp:
 
     def _start_kiwiclientd(self, sdr_entry):
         self._stop_kiwiclientd()
+        # Always bound to a local port dedicated to the managed kiwiclientd, distinct
+        # from rigctl_host/rigctl_port (which may point at a real rigctld elsewhere,
+        # e.g. talking to an actual radio) -- kiwipanadapter itself is the only
+        # client of this port, relaying the true frequency/mode into it so
+        # kiwiclientd's SDR audio channel stays tuned to match (see RigctlPoller's
+        # mirror_target).
         argv = [sys.executable, self._options.kiwiclientd_path,
                 '-s', sdr_entry['host'], '-p', str(sdr_entry['port']),
-                '--rigctl-addr', self._options.rigctl_host,
-                '--rigctl-port', str(self._options.rigctl_port),
+                '--rigctl-addr', '127.0.0.1',
+                '--rigctl-port', str(self._options.kiwiclientd_rigctl_port),
                 '--enable-rigctl']
         if self._options.kiwiclientd_args:
             argv += shlex.split(self._options.kiwiclientd_args)
@@ -826,11 +878,16 @@ def parse_args():
                     help='path to kiwiclientd.py, started/restarted automatically for the selected SDR (config: kiwiclientd_path)')
     p.add_argument('--kiwiclientd-args', dest='kiwiclientd_args', default=cfg.get('kiwiclientd_args', ''),
                     help='extra arguments appended to the managed kiwiclientd invocation, e.g. "--snddev kiwisnd0" (config: kiwiclientd_args)')
+    p.add_argument('--kiwiclientd-rigctl-port', dest='kiwiclientd_rigctl_port', type=int,
+                    default=cfg.get('kiwiclientd_rigctl_port', 6400),
+                    help='local port the managed kiwiclientd binds its own rigctld emulation to (always '
+                         '127.0.0.1) -- kept separate from rigctl_host/rigctl_port so that can point at a '
+                         'real rigctld elsewhere; kiwipanadapter relays the true frequency/mode into this '
+                         'port so kiwiclientd\'s SDR audio channel stays tuned to match (config: kiwiclientd_rigctl_port)')
     p.add_argument('--no-kiwiclientd', dest='no_kiwiclientd', action='store_true',
                     default=cfg.get('no_kiwiclientd', False),
-                    help="don't start/manage kiwiclientd -- use this for a real-radio setup where a "
-                         "real rigctld (config: rigctl_host/rigctl_port) is already the frequency source "
-                         "(config: no_kiwiclientd)")
+                    help="don't start/manage kiwiclientd at all -- use this only if you don't want an "
+                         "SDR audio node available (config: no_kiwiclientd)")
     p.add_argument('--log-level', default='warn', choices=['debug', 'info', 'warn', 'error'])
     return p.parse_args()
 
