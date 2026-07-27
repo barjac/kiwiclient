@@ -575,7 +575,7 @@ class PanadapterApp:
         ttk.Label(meter, text='S:').pack(side='left')
         self._dbm_var = tk.StringVar(value='-- dBm')
         ttk.Label(meter, textvariable=self._dbm_var).pack(side='right', padx=8)
-        self._smeter_canvas = tk.Canvas(meter, height=22, highlightthickness=0, bg='black')
+        self._smeter_canvas = tk.Canvas(meter, height=28, highlightthickness=0, bg='black')
         self._smeter_canvas.pack(side='left', fill='x', expand=True, padx=4)
 
         self._freqaxis_canvas = tk.Canvas(self._root, height=20, highlightthickness=0, bg='black')
@@ -818,15 +818,21 @@ class PanadapterApp:
         c = self._smeter_canvas
         c.delete('all')
         w_total = max(1, c.winfo_width())
+        h_total = max(1, c.winfo_height())
+        bar_h = 6
+        bar_top = h_total - bar_h
         frac = max(0.0, min(1.0, (dbm - self._mindb) / (self._maxdb - self._mindb)))
         w = int(frac * w_total)
         color = '#00ff00' if dbm < -73 else ('#ffff00' if dbm < -43 else '#ff3030')
-        c.create_rectangle(0, 0, w, 22, fill=color, width=0)
-        # S-unit ticks: S9 = -73 dBm, 6 dB/S-unit below S9, 10 dB/S-unit ("+" values) above
-        for label, ref_dbm in [('S1', -73 - 6 * 8), ('S5', -73 - 6 * 4), ('S9', -73), ('+20', -53), ('+40', -33)]:
+        c.create_rectangle(0, bar_top, w, h_total, fill=color, width=0)
+        # S-unit ticks: S9 = -73 dBm, 6 dB/S-unit below S9, 10 dB/S-unit ("+" values) above.
+        # Labels/ticks live above the bar so the bar itself stays a slim strip underneath.
+        s_points = [('S%d' % n, -73 - 6 * (9 - n)) for n in range(1, 10)]
+        plus_points = [('+%d' % p, -73 + p) for p in (10, 20, 30, 40)]
+        for label, ref_dbm in s_points + plus_points:
             x = int(max(0.0, min(1.0, (ref_dbm - self._mindb) / (self._maxdb - self._mindb))) * w_total)
-            c.create_line(x, 0, x, 22, fill='#808080')
-            c.create_text(x + 2, 11, text=label, fill='white', anchor='w', font=('TkFixedFont', 7))
+            c.create_line(x, 0, x, bar_top, fill='#808080')
+            c.create_text(x + 2, 0, text=label, fill='white', anchor='n', font=('TkFixedFont', 7))
 
     def _on_close(self):
         try:
