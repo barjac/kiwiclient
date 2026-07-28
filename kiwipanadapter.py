@@ -53,6 +53,9 @@ CONFIG_SCHEMA = {
     'rigctl_port': int,
     'default_freq': float,
     'smeter_decay_db_sec': float,
+    'smeter_cal_db': float,
+    'smeter_peak_hold_sec': float,
+    'smeter_peak_decay_db_sec': float,
     'smeter_passband_center_hz': float,
     'smeter_passband_bw_hz': float,
     'freq_major_khz': float,
@@ -180,6 +183,9 @@ def load_config(path):
             f.write("rigctl_port     6400\n")
             f.write("default_freq    14200\n")
             f.write("smeter_decay_db_sec  20\n")
+            f.write("smeter_cal_db  12\n")
+            f.write("smeter_peak_hold_sec  3\n")
+            f.write("smeter_peak_decay_db_sec  2\n")
             f.write("smeter_passband_center_hz  1500\n")
             f.write("smeter_passband_bw_hz      2400\n")
             f.write("freq_major_khz  5\n")
@@ -514,6 +520,9 @@ class PanadapterApp:
         self._mindb = options.mindb
         self._maxdb = options.maxdb
         self._smeter_decay = options.smeter_decay
+        self._smeter_cal_db = options.smeter_cal_db
+        self._smeter_peak_hold_sec = options.smeter_peak_hold_sec
+        self._smeter_peak_decay = options.smeter_peak_decay_db_sec
         self._smeter_passband_center_hz = options.smeter_passband_center_hz
         self._smeter_passband_bw_hz = options.smeter_passband_bw_hz
         self._freq_major_khz = options.freq_major_khz
@@ -529,6 +538,9 @@ class PanadapterApp:
         self._last_signal_dbm = None
         self._smeter_dbm = None
         self._smeter_last_ts = None
+        self._smeter_peak_dbm = None
+        self._smeter_peak_set_ts = None
+        self._smeter_peak_last_ts = None
         self._last_start = None
         self._last_stop = None
         self._kiwiclientd_proc = None
@@ -648,6 +660,9 @@ class PanadapterApp:
         self._img_buf[:] = 0
         self._smeter_dbm = None
         self._smeter_last_ts = None
+        self._smeter_peak_dbm = None
+        self._smeter_peak_set_ts = None
+        self._smeter_peak_last_ts = None
         if not self._options.no_kiwiclientd:
             self._start_kiwiclientd(entry)
         self._start_stream(entry)
@@ -762,7 +777,14 @@ class PanadapterApp:
         lo_idx, hi_idx = sorted((lo_idx, hi_idx))
         lo_idx = max(0, min(n_bins - 1, lo_idx))
         hi_idx = max(0, min(n_bins - 1, hi_idx))
-        instantaneous_dbm = np.max(row['dbm'][lo_idx:hi_idx + 1]) + WF_CAL
+        # Total power across the passband, not the single strongest bin: a
+        # real S-meter (analog AGC, or a webSDR's) responds to total energy
+        # through its receive filter. That's the same as a lone tone's power
+        # for a single-carrier SSB voice signal, but for a multi-carrier
+        # digital mode (FreeDV COFDM etc, power spread across many subcarrier
+        # bins) taking just the max bin badly undercounts the real level.
+        bin_dbm = row['dbm'][lo_idx:hi_idx + 1] + WF_CAL
+        instantaneous_dbm = 10.0 * np.log10(np.sum(np.power(10.0, bin_dbm / 10.0))) + self._smeter_cal_db
 
         now = time.time()
         if self._smeter_dbm is None or instantaneous_dbm >= self._smeter_dbm:
@@ -773,6 +795,20 @@ class PanadapterApp:
             self._smeter_dbm = max(instantaneous_dbm, self._smeter_dbm - max_fall)   # slow decay
         self._smeter_last_ts = now
         self._last_signal_dbm = self._smeter_dbm
+
+        # Peak-hold: tracks the raw instantaneous reading (not the smoothed
+        # self._smeter_dbm above), frozen for smeter_peak_hold_sec after each
+        # new peak, then falling slowly. Row-sampled instantaneous readings can
+        # miss brief SSB syllabic peaks between waterfall rows -- holding the
+        # peak visually makes those still readable rather than blinking past.
+        if self._smeter_peak_dbm is None or instantaneous_dbm >= self._smeter_peak_dbm:
+            self._smeter_peak_dbm = instantaneous_dbm
+            self._smeter_peak_set_ts = now
+        elif (now - self._smeter_peak_set_ts) >= self._smeter_peak_hold_sec:
+            dt = (now - self._smeter_peak_last_ts) if self._smeter_peak_last_ts is not None else 0.0
+            max_fall = self._smeter_peak_decay * dt
+            self._smeter_peak_dbm = max(instantaneous_dbm, self._smeter_peak_dbm - max_fall)
+        self._smeter_peak_last_ts = now
 
     def _on_resize(self, _event):
         self._redraw()
@@ -818,7 +854,7 @@ class PanadapterApp:
 
         if self._last_signal_dbm is not None:
             self._dbm_var.set('%.0f dBm' % self._last_signal_dbm)
-            self._draw_smeter(self._last_signal_dbm)
+            self._draw_smeter(self._last_signal_dbm, self._smeter_peak_dbm)
 
         if self._last_start is not None:
             self._draw_freq_axis(self._last_start, self._last_stop)
@@ -850,17 +886,26 @@ class PanadapterApp:
             x = int((freq - start_khz) / span * w)
             c.create_line(x, 0, x, h, fill='#ff00ff', width=1)
 
-    def _draw_smeter(self, dbm):
+    def _draw_smeter(self, dbm, peak_dbm=None):
         c = self._smeter_canvas
         c.delete('all')
         w_total = max(1, c.winfo_width())
         h_total = max(1, c.winfo_height())
         bar_h = 6
         bar_top = h_total - bar_h
-        frac = max(0.0, min(1.0, (dbm - self._mindb) / (self._maxdb - self._mindb)))
-        w = int(frac * w_total)
-        color = '#00ff00' if dbm < -73 else ('#ffff00' if dbm < -43 else '#ff3030')
-        c.create_rectangle(0, bar_top, w, h_total, fill=color, width=0)
+
+        def frac_of(val):
+            return max(0.0, min(1.0, (val - self._mindb) / (self._maxdb - self._mindb)))
+
+        # Peak-hold bar, drawn first/underneath in a dimmed stipple fill so it
+        # reads as a distinct layer -- only the portion beyond the current-level
+        # bar (drawn on top, below) stays visible, as a long-hang "tail".
+        if peak_dbm is not None:
+            peak_w = int(frac_of(peak_dbm) * w_total)
+            c.create_rectangle(0, bar_top, peak_w, h_total, fill='#ff3030', width=0, stipple='gray50')
+
+        w = int(frac_of(dbm) * w_total)
+        c.create_rectangle(0, bar_top, w, h_total, fill='#00ff00', width=0)
         # S-unit ticks: S9 = -73 dBm, 6 dB/S-unit below S9, 10 dB/S-unit ("+" values) above.
         # Labels/ticks live above the bar so the bar itself stays a slim strip underneath.
         s_points = [('S%d' % n, -73 - 6 * (9 - n)) for n in range(1, 10)]
@@ -905,6 +950,19 @@ def parse_args():
     p.add_argument('--smeter-decay', dest='smeter_decay', type=float,
                     default=cfg.get('smeter_decay_db_sec', 20.0),
                     help='S-meter decay rate in dB/sec after a peak; attack is instant (config: smeter_decay_db_sec, default 20)')
+    p.add_argument('--smeter-cal', dest='smeter_cal_db', type=float,
+                    default=cfg.get('smeter_cal_db', 12.0),
+                    help='S-meter calibration offset in dB, added to the computed reading -- tune '
+                         'this against a trusted reference (e.g. a webSDR on the same signal) '
+                         '(config: smeter_cal_db, default 12 = +2 S-units)')
+    p.add_argument('--smeter-peak-hold', dest='smeter_peak_hold_sec', type=float,
+                    default=cfg.get('smeter_peak_hold_sec', 3.0),
+                    help='seconds a peak-hold reading stays frozen before it starts decaying '
+                         '(config: smeter_peak_hold_sec, default 3)')
+    p.add_argument('--smeter-peak-decay', dest='smeter_peak_decay_db_sec', type=float,
+                    default=cfg.get('smeter_peak_decay_db_sec', 2.0),
+                    help='peak-hold decay rate in dB/sec once the hold time has elapsed '
+                         '(config: smeter_peak_decay_db_sec, default 2)')
     p.add_argument('--smeter-passband-center', dest='smeter_passband_center_hz', type=float,
                     default=cfg.get('smeter_passband_center_hz', 1500.0),
                     help='S-meter passband center offset from dial frequency, in Hz -- e.g. 1500 for '
