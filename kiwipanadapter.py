@@ -519,6 +519,12 @@ class PanadapterApp:
 
         self._mindb = options.mindb
         self._maxdb = options.maxdb
+        # S-meter scale is deliberately independent of the waterfall's own
+        # mindb/maxdb -- the right-click sensitivity menu below adjusts only
+        # waterfall brightness/contrast, it must never move the S-meter's
+        # tick positions or bar-fill calibration.
+        self._smeter_mindb = options.mindb
+        self._smeter_maxdb = options.maxdb
         self._smeter_decay = options.smeter_decay
         self._smeter_cal_db = options.smeter_cal_db
         self._smeter_peak_hold_sec = options.smeter_peak_hold_sec
@@ -895,7 +901,7 @@ class PanadapterApp:
         bar_top = h_total - bar_h
 
         def frac_of(val):
-            return max(0.0, min(1.0, (val - self._mindb) / (self._maxdb - self._mindb)))
+            return max(0.0, min(1.0, (val - self._smeter_mindb) / (self._smeter_maxdb - self._smeter_mindb)))
 
         # Peak-hold bar, drawn first/underneath in a dimmed stipple fill so it
         # reads as a distinct layer -- only the portion beyond the current-level
@@ -911,7 +917,7 @@ class PanadapterApp:
         s_points = [('S%d' % n, -73 - 6 * (9 - n)) for n in range(1, 10)]
         plus_points = [('+%d' % p, -73 + p) for p in (10, 20, 30, 40)]
         for label, ref_dbm in s_points + plus_points:
-            x = int(max(0.0, min(1.0, (ref_dbm - self._mindb) / (self._maxdb - self._mindb))) * w_total)
+            x = int(max(0.0, min(1.0, (ref_dbm - self._smeter_mindb) / (self._smeter_maxdb - self._smeter_mindb))) * w_total)
             c.create_line(x, 0, x, bar_top, fill='#808080')
             c.create_text(x + 2, 0, text=label, fill='white', anchor='n', font=('TkFixedFont', 7))
 
