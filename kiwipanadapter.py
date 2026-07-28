@@ -53,6 +53,8 @@ CONFIG_SCHEMA = {
     'rigctl_port': int,
     'default_freq': float,
     'smeter_decay_db_sec': float,
+    'smeter_passband_center_hz': float,
+    'smeter_passband_bw_hz': float,
     'freq_major_khz': float,
     'freq_minor_khz': float,
     'window_height': int,
@@ -178,6 +180,8 @@ def load_config(path):
             f.write("rigctl_port     6400\n")
             f.write("default_freq    14200\n")
             f.write("smeter_decay_db_sec  20\n")
+            f.write("smeter_passband_center_hz  1500\n")
+            f.write("smeter_passband_bw_hz      2400\n")
             f.write("freq_major_khz  5\n")
             f.write("freq_minor_khz  1\n")
             f.write("window_height   %d\n" % DEFAULT_WINDOW_HEIGHT)
@@ -510,6 +514,8 @@ class PanadapterApp:
         self._mindb = options.mindb
         self._maxdb = options.maxdb
         self._smeter_decay = options.smeter_decay
+        self._smeter_passband_center_hz = options.smeter_passband_center_hz
+        self._smeter_passband_bw_hz = options.smeter_passband_bw_hz
         self._freq_major_khz = options.freq_major_khz
         self._freq_minor_khz = options.freq_minor_khz
         self._current_freq_khz = None
@@ -737,9 +743,26 @@ class PanadapterApp:
         self._last_stop = row['stop']
 
         center_khz = row['center']
-        bin_idx = int(round((center_khz - row['start']) / (row['stop'] - row['start']) * (len(row['dbm']) - 1)))
-        bin_idx = max(0, min(len(row['dbm']) - 1, bin_idx))
-        instantaneous_dbm = row['dbm'][bin_idx] + WF_CAL
+        n_bins = len(row['dbm'])
+        span_khz = row['stop'] - row['start']
+
+        # S-meter passband is an offset+bandwidth from the dial frequency,
+        # not the dial frequency itself -- for SSB/FreeDV the dial frequency
+        # sits at the suppressed-carrier edge, outside the actual signal.
+        # Configurable so it can be tailored to whatever passband FreeDV (or
+        # any other mode) actually occupies (config: smeter_passband_center_hz,
+        # smeter_passband_bw_hz).
+        pb_center_khz = self._smeter_passband_center_hz / 1000.0
+        pb_half_khz = self._smeter_passband_bw_hz / 2000.0
+        lo_khz = center_khz + pb_center_khz - pb_half_khz
+        hi_khz = center_khz + pb_center_khz + pb_half_khz
+
+        lo_idx = int(round((lo_khz - row['start']) / span_khz * (n_bins - 1)))
+        hi_idx = int(round((hi_khz - row['start']) / span_khz * (n_bins - 1)))
+        lo_idx, hi_idx = sorted((lo_idx, hi_idx))
+        lo_idx = max(0, min(n_bins - 1, lo_idx))
+        hi_idx = max(0, min(n_bins - 1, hi_idx))
+        instantaneous_dbm = np.max(row['dbm'][lo_idx:hi_idx + 1]) + WF_CAL
 
         now = time.time()
         if self._smeter_dbm is None or instantaneous_dbm >= self._smeter_dbm:
@@ -882,6 +905,15 @@ def parse_args():
     p.add_argument('--smeter-decay', dest='smeter_decay', type=float,
                     default=cfg.get('smeter_decay_db_sec', 20.0),
                     help='S-meter decay rate in dB/sec after a peak; attack is instant (config: smeter_decay_db_sec, default 20)')
+    p.add_argument('--smeter-passband-center', dest='smeter_passband_center_hz', type=float,
+                    default=cfg.get('smeter_passband_center_hz', 1500.0),
+                    help='S-meter passband center offset from dial frequency, in Hz -- e.g. 1500 for '
+                         'a typical USB/FreeDV passband, negative for LSB (config: smeter_passband_center_hz, default 1500)')
+    p.add_argument('--smeter-passband-bw', dest='smeter_passband_bw_hz', type=float,
+                    default=cfg.get('smeter_passband_bw_hz', 2400.0),
+                    help='S-meter passband bandwidth in Hz, centered on smeter_passband_center_hz -- '
+                         'tailor this to the actual bandwidth of the FreeDV mode in use '
+                         '(config: smeter_passband_bw_hz, default 2400)')
     p.add_argument('--freq-major', dest='freq_major_khz', type=float, default=cfg.get('freq_major_khz', 5.0),
                     help='major (labeled) frequency axis tick spacing in kHz (config: freq_major_khz, default 5)')
     p.add_argument('--freq-minor', dest='freq_minor_khz', type=float, default=cfg.get('freq_minor_khz', 1.0),
