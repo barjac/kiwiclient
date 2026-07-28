@@ -58,6 +58,9 @@ CONFIG_SCHEMA = {
     'smeter_peak_decay_db_sec': float,
     'smeter_passband_center_hz': float,
     'smeter_passband_bw_hz': float,
+    'wf_auto_range_db': float,
+    'wf_auto_beta': float,
+    'wf_auto_percentile': float,
     'freq_major_khz': float,
     'freq_minor_khz': float,
     'window_height': int,
@@ -188,6 +191,9 @@ def load_config(path):
             f.write("smeter_peak_decay_db_sec  2\n")
             f.write("smeter_passband_center_hz  1500\n")
             f.write("smeter_passband_bw_hz      2400\n")
+            f.write("wf_auto_range_db  50\n")
+            f.write("wf_auto_beta      0.9\n")
+            f.write("wf_auto_percentile  10\n")
             f.write("freq_major_khz  5\n")
             f.write("freq_minor_khz  1\n")
             f.write("window_height   %d\n" % DEFAULT_WINDOW_HEIGHT)
@@ -531,6 +537,22 @@ class PanadapterApp:
         self._smeter_peak_decay = options.smeter_peak_decay_db_sec
         self._smeter_passband_center_hz = options.smeter_passband_center_hz
         self._smeter_passband_bw_hz = options.smeter_passband_bw_hz
+        # Waterfall auto-level: floating [noise-floor, noise-floor+range] window.
+        # Inspired by FreeDV-GUI's PlotWaterfall (src/gui/controls/plot_waterfall.cpp),
+        # but anchored to a low percentile of the row (an estimated noise floor)
+        # rather than the peak -- peak-anchoring means a single strong bin (a
+        # tune-up carrier, a birdie, a distant strong station elsewhere in the
+        # span) instantly redefines the window and can push the actual signal
+        # of interest below black. A percentile is robust to a handful of such
+        # outlier bins regardless of where in the span they sit. The floor
+        # estimate is smoothed (EMA) so it doesn't jitter row to row; the
+        # headroom above it is a fixed range. Off by default; selected via the
+        # right-click sensitivity menu.
+        self._wf_auto = False
+        self._wf_auto_range_db = options.wf_auto_range_db
+        self._wf_auto_beta = options.wf_auto_beta
+        self._wf_auto_percentile = options.wf_auto_percentile
+        self._wf_auto_floor_dbm = None
         self._freq_major_khz = options.freq_major_khz
         self._freq_minor_khz = options.freq_minor_khz
         self._current_freq_khz = None
@@ -669,6 +691,7 @@ class PanadapterApp:
         self._smeter_peak_dbm = None
         self._smeter_peak_set_ts = None
         self._smeter_peak_last_ts = None
+        self._wf_auto_floor_dbm = None
         if not self._options.no_kiwiclientd:
             self._start_kiwiclientd(entry)
         self._start_stream(entry)
@@ -753,8 +776,21 @@ class PanadapterApp:
         self._root.after(150, self._poll_queue)
 
     def _ingest_row(self, row):
-        dbm = np.clip(row['dbm'] + WF_CAL, self._mindb, self._maxdb)
-        idx = ((dbm - self._mindb) / (self._maxdb - self._mindb) * 255).astype(np.uint8)
+        calibrated = row['dbm'] + WF_CAL
+        if self._wf_auto:
+            floor = float(np.percentile(calibrated, self._wf_auto_percentile))
+            if self._wf_auto_floor_dbm is None:
+                self._wf_auto_floor_dbm = floor
+            else:
+                self._wf_auto_floor_dbm = (self._wf_auto_beta * self._wf_auto_floor_dbm
+                                            + (1.0 - self._wf_auto_beta) * floor)
+            lo = self._wf_auto_floor_dbm
+            hi = lo + max(self._wf_auto_range_db, 1.0)
+        else:
+            lo, hi = self._mindb, self._maxdb
+
+        dbm = np.clip(calibrated, lo, hi)
+        idx = ((dbm - lo) / (hi - lo) * 255).astype(np.uint8)
         rgb_row = COLORMAP[idx]
 
         self._img_buf[1:] = self._img_buf[:-1]
@@ -836,12 +872,20 @@ class PanadapterApp:
             menu.add_radiobutton(
                 label=label, variable=self._sensitivity_var, value=label,
                 command=lambda mn=mindb, mx=maxdb: self._set_sensitivity(mn, mx))
+        menu.add_radiobutton(
+            label='Auto (adaptive)', variable=self._sensitivity_var, value='Auto (adaptive)',
+            command=self._set_auto_sensitivity)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
+    def _set_auto_sensitivity(self):
+        self._wf_auto = True
+        self._wf_auto_floor_dbm = None
+
     def _set_sensitivity(self, mindb, maxdb):
+        self._wf_auto = False
         self._mindb = mindb
         self._maxdb = maxdb
         self._redraw()
@@ -978,6 +1022,19 @@ def parse_args():
                     help='S-meter passband bandwidth in Hz, centered on smeter_passband_center_hz -- '
                          'tailor this to the actual bandwidth of the FreeDV mode in use '
                          '(config: smeter_passband_bw_hz, default 2400)')
+    p.add_argument('--wf-auto-range', dest='wf_auto_range_db', type=float,
+                    default=cfg.get('wf_auto_range_db', 50.0),
+                    help='waterfall auto-level headroom in dB above the estimated noise floor, when "Auto (adaptive)" '
+                         'is selected from the right-click sensitivity menu (config: wf_auto_range_db, default 50)')
+    p.add_argument('--wf-auto-beta', dest='wf_auto_beta', type=float,
+                    default=cfg.get('wf_auto_beta', 0.9),
+                    help='waterfall auto-level smoothing factor (0-1, higher = slower/steadier) for the estimated '
+                         'noise floor (config: wf_auto_beta, default 0.9)')
+    p.add_argument('--wf-auto-percentile', dest='wf_auto_percentile', type=float,
+                    default=cfg.get('wf_auto_percentile', 10.0),
+                    help='percentile of the row used as the waterfall auto-level noise-floor estimate -- low enough '
+                         'to be robust against a handful of strong outlier bins (a carrier, a birdie, a distant '
+                         'strong station) anywhere in the visible span (config: wf_auto_percentile, default 10)')
     p.add_argument('--freq-major', dest='freq_major_khz', type=float, default=cfg.get('freq_major_khz', 5.0),
                     help='major (labeled) frequency axis tick spacing in kHz (config: freq_major_khz, default 5)')
     p.add_argument('--freq-minor', dest='freq_minor_khz', type=float, default=cfg.get('freq_minor_khz', 1.0),
