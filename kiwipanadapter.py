@@ -633,7 +633,9 @@ class PanadapterApp:
         meter.pack(side='bottom', fill='x', padx=4, pady=(2, 4))
         ttk.Label(meter, text='S:').pack(side='left')
         self._dbm_var = tk.StringVar(value='-- dBm')
-        ttk.Label(meter, textvariable=self._dbm_var).pack(side='right', padx=8)
+        # Fixed width so the S-meter canvas next to it (fill='x', expand=True)
+        # doesn't resize when the dBm text's digit count changes (e.g. -99 -> -100).
+        ttk.Label(meter, textvariable=self._dbm_var, width=8, anchor='e').pack(side='right', padx=8)
         self._smeter_canvas = tk.Canvas(meter, height=28, highlightthickness=0, bg='black')
         self._smeter_canvas.pack(side='left', fill='x', expand=True, padx=4)
 
