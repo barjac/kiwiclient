@@ -395,8 +395,17 @@ class KiwiSoundRecorder(KiwiSDRStream):
 
     def _on_sample_rate_change(self):
         if self._options.resample == 0:
-            # if self._output_sample_rate == int(self._sample_rate):
-            #    return
+            if self._output_sample_rate == int(self._sample_rate):
+                # Rate genuinely unchanged -- don't tear down and rebuild the
+                # audio player (new PipeWire/sound device node, restarted
+                # playback thread) just because the Kiwi re-sent a
+                # 'sample_rate' message, e.g. in response to a redundant
+                # 'SET mod=...' from a repeated rigctl mode-set. A caller
+                # (kiwipanadapter's rigctl mirror) that re-sends F/M on every
+                # poll tick regardless of whether anything changed was
+                # observed to retrigger this on every tick, silently
+                # dropping the FreeDV audio path each time.
+                return
             # reinitialize player if the playback sample rate changed
             self._output_sample_rate = int(self._sample_rate)
             self._init_player()

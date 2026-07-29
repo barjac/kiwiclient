@@ -70,6 +70,7 @@ CONFIG_SCHEMA = {
     'kiwiclientd_args': str,
     'no_kiwiclientd': parse_bool,
     'kiwiclientd_rigctl_port': int,
+    'last_sdr': str,
 }
 
 
@@ -285,9 +286,18 @@ class RigctlPoller(threading.Thread):
         self._mirror_target = mirror_target
         self._stop_event = threading.Event()
         self._recv_buf = ''
+        self._last_pushed = None
 
     def stop(self):
         self._stop_event.set()
+
+    def resync(self):
+        """Force the next tick to re-push F/M to the mirror even if unchanged --
+        call this right after the mirror's kiwiclientd has been (re)started, since
+        its freshly-spawned rigctld emulation won't have the current freq/mode yet
+        and the change-dedup in run() would otherwise wait for the next real
+        frequency/mode change before sending anything."""
+        self._last_pushed = None
 
     def _read_line(self, sock):
         # Proper line buffering: a single recv() can deliver more than one
@@ -330,7 +340,17 @@ class RigctlPoller(threading.Thread):
                         passband_hz = int(self._read_line(sock))
                     except Exception:
                         passband_hz = None
-                    self._push_to_mirror(freq_hz, mode, passband_hz)
+                    # Only push when something actually changed -- pushing
+                    # unconditionally every poll tick (previously every 0.5s)
+                    # made kiwiclientd's set_mod() re-send 'SET mod=...' to the
+                    # Kiwi just as often, which was retriggering a full audio
+                    # player teardown/rebuild (kiwiclientd.py's
+                    # _on_sample_rate_change -> _init_player) on every tick and
+                    # was the likely cause of FreeDV's audio dropping out.
+                    key = (round(freq_hz), mode, passband_hz)
+                    if key != self._last_pushed:
+                        self._push_to_mirror(freq_hz, mode, passband_hz)
+                        self._last_pushed = key
             except Exception as e:
                 logging.debug('rigctl poll error: %s', e)
                 if sock is not None:
@@ -522,6 +542,7 @@ class PanadapterApp:
         self._sdr_list = load_sdr_list(options.sdr_list)
         if not self._sdr_list:
             raise Exception('No SDRs in %s -- add at least one "name host port" line' % options.sdr_list)
+        self._initial_sdr = next((s for s in self._sdr_list if s['name'] == options.last_sdr), self._sdr_list[0])
 
         self._mindb = options.mindb
         self._maxdb = options.maxdb
@@ -546,9 +567,9 @@ class PanadapterApp:
         # of interest below black. A percentile is robust to a handful of such
         # outlier bins regardless of where in the span they sit. The floor
         # estimate is smoothed (EMA) so it doesn't jitter row to row; the
-        # headroom above it is a fixed range. Off by default; selected via the
-        # right-click sensitivity menu.
-        self._wf_auto = False
+        # headroom above it is a fixed range. On by default; can be overridden
+        # via the right-click sensitivity menu.
+        self._wf_auto = True
         self._wf_auto_range_db = options.wf_auto_range_db
         self._wf_auto_beta = options.wf_auto_beta
         self._wf_auto_percentile = options.wf_auto_percentile
@@ -579,7 +600,7 @@ class PanadapterApp:
         root.update_idletasks()   # so winfo_width/height are accurate before the first row arrives
 
         if not self._options.no_kiwiclientd:
-            self._start_kiwiclientd(self._sdr_list[0])
+            self._start_kiwiclientd(self._initial_sdr)
 
         mirror_target = None
         if not self._options.no_kiwiclientd:
@@ -590,8 +611,8 @@ class PanadapterApp:
                                             mirror_target=mirror_target)
         self._rigctl_poller.start()
 
-        self._start_stream(self._sdr_list[0])
-        self._active_sdr = self._sdr_list[0]
+        self._start_stream(self._initial_sdr)
+        self._active_sdr = self._initial_sdr
         root.protocol('WM_DELETE_WINDOW', self._on_close)
         self._poll_queue()
 
@@ -610,7 +631,7 @@ class PanadapterApp:
         top.pack(side='top', fill='x', padx=4, pady=4)
 
         ttk.Label(top, text='SDR:').pack(side='left')
-        self._sdr_var = tk.StringVar(value=self._sdr_list[0]['name'])
+        self._sdr_var = tk.StringVar(value=self._initial_sdr['name'])
         combo_width = max((len(s['name']) for s in self._sdr_list), default=10) + 2
         self._sdr_combo = ttk.Combobox(top, textvariable=self._sdr_var, state='readonly',
                                         width=combo_width,
@@ -646,7 +667,7 @@ class PanadapterApp:
         self._canvas.pack(side='top', fill='both', expand=True)
         self._image_id = self._canvas.create_image(0, 0, anchor='nw')
         self._canvas.bind('<Configure>', self._on_resize)
-        self._sensitivity_var = tk.StringVar(value='Normal')
+        self._sensitivity_var = tk.StringVar(value='Auto (adaptive)')
         self._canvas.bind('<Button-3>', self._show_sensitivity_menu)
 
     # -- SDR connection management -------------------------------------------------
@@ -696,8 +717,13 @@ class PanadapterApp:
         self._wf_auto_floor_dbm = None
         if not self._options.no_kiwiclientd:
             self._start_kiwiclientd(entry)
+            self._rigctl_poller.resync()
         self._start_stream(entry)
         self._active_sdr = entry
+        try:
+            save_config_value(self._options.config, 'last_sdr', entry['name'])
+        except Exception as e:
+            logging.debug('failed to save last_sdr: %s', e)
 
     def _open_sdr_manager(self):
         SdrListDialog(self._root, self._sdr_list, self._options.sdr_list, self._on_sdr_list_changed)
@@ -1051,6 +1077,9 @@ def parse_args():
     p.add_argument('--window-y', dest='window_y', type=int, default=cfg.get('window_y', None),
                     help='initial window Y position in pixels; saved back to the config on graceful exit (config: window_y)')
     p.add_argument('--sdr-list', default=DEFAULT_SDR_LIST, help='flat text file of "name host port" SDR entries')
+    p.add_argument('--last-sdr', dest='last_sdr', default=cfg.get('last_sdr', None),
+                    help='name of the SDR entry selected last session; used as the initial selection, saved back '
+                         'to the config whenever the SDR dropdown changes (config: last_sdr)')
     p.add_argument('--user', default='kiwipanadapter', help='client name reported to the Kiwi')
     p.add_argument('--default-freq', dest='default_freq', type=float, default=cfg.get('default_freq', 14200.0),
                     help='initial center frequency (kHz) used until the first rigctl poll arrives (config: default_freq)')
