@@ -1,35 +1,43 @@
 #!/usr/bin/env python3
 ## -*- python -*-
 #
-# Lightweight local panadapter: a live waterfall + S-meter for the band
-# around whatever frequency FreeDV (via kiwiclientd's rigctl emulation)
-# is currently tuned to. Deliberately avoids a browser and heavy GUI
+# Lightweight local panadapter: a live waterfall + S-meter + audio player
+# for the band around whatever frequency FreeDV (via a real rigctld) is
+# currently tuned to. Deliberately avoids a browser and heavy GUI
 # toolkits/plotting libraries to keep CPU/GPU load down; uses stock
 # Tkinter only.
 #
-# The frequency is learned by polling kiwiclientd's rigctld TCP port
-# (the same interface FreeDV itself talks to) -- this script never
-# touches kiwiclientd directly, it's just another rigctl client.
+# The frequency/mode is learned by polling a rigctld TCP port (the same
+# interface FreeDV itself talks to, normally a real hamlib rigctld driving
+# an actual radio) -- this script is just another rigctl client. Waterfall
+# (LiveWFStream) and audio (LiveAudioStream) are two independent Kiwi
+# connections, both retuned in-process from that same rigctl polling --
+# audio no longer needs a separately-spawned kiwiclientd.py process.
 
 import argparse
 import logging
 import math
 import os
 import queue
-import shlex
 import socket
-import subprocess
-import sys
 import threading
 import time
+from queue import Queue, Empty
 from types import SimpleNamespace
 
 import numpy as np
+import soundcard as sc
 import tkinter as tk
 from tkinter import ttk
 
 from kiwi.client import KiwiSDRStream
 from kiwi.worker import KiwiWorker
+
+HAS_RESAMPLER = True
+try:
+    from samplerate import Resampler
+except ImportError:
+    HAS_RESAMPLER = False
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SDR_LIST = os.path.join(SCRIPT_DIR, 'sdr_list.txt')
@@ -66,11 +74,20 @@ CONFIG_SCHEMA = {
     'window_height': int,
     'window_x': int,
     'window_y': int,
-    'kiwiclientd_path': str,
-    'kiwiclientd_args': str,
-    'no_kiwiclientd': parse_bool,
-    'kiwiclientd_rigctl_port': int,
     'last_sdr': str,
+    'modulation': str,
+    'sounddevice': str,
+    'ncomp': parse_bool,
+    'lp_cut': float,
+    'hp_cut': float,
+    'agc_gain': float,
+    'blocksize': int,
+    'nb': parse_bool,
+    'nb_gate': int,
+    'nb_thresh': int,
+    'de_emp': parse_bool,
+    'resample': int,
+    'ifreq': float,
 }
 
 
@@ -128,15 +145,22 @@ def build_colormap():
 COLORMAP = build_colormap()
 
 
-def make_stream_options(host, port, user):
-    """Minimal attribute set KiwiSDRStream/KiwiWorker need for a plain W/F connection."""
+def make_stream_options(host, port, options, ws_offset=0):
+    """Attribute set KiwiSDRStream/KiwiWorker need, covering both
+    LiveWFStream (a plain W/F-only connection, like kiwirecorder's own
+    KiwiWaterfallRecorder) and LiveAudioStream (audio playback, ported from
+    kiwiclientd's KiwiSoundRecorder) -- these are two independent
+    connections/channels, so each needs its own options with a distinct
+    ws_timestamp (ws_offset differentiates them; without it, two
+    same-process connections built in the same second would collide on the
+    timestamp baked into the connection URL)."""
     return SimpleNamespace(
         server_host=host,
         server_port=port,
         password='',
         admin=False,
         tlimit_password='',
-        user=user,
+        user=options.user,
         nolocal=False,
         ADC_OV=False,
         idx=0,
@@ -150,16 +174,26 @@ def make_stream_options(host, port, user):
         rev_bin=False,
         wf_cal=WF_CAL,
         freq_pbc=False,
-        modulation='am',
-        lp_cut=None,
-        hp_cut=None,
+        modulation=options.modulation,
+        lp_cut=options.lp_cut,
+        hp_cut=options.hp_cut,
         wideband=False,
-        ws_timestamp=int(time.time() + os.getpid()) & 0xffffffff,
+        ws_timestamp=int(time.time() + os.getpid() + ws_offset) & 0xffffffff,
         bad_cmd=False,
-        sound=False,
-        resample=0,
-        nb=False,
+        sound=True,
+        resample=options.resample,
+        nb=options.nb,
+        nb_gate=options.nb_gate,
+        nb_thresh=options.nb_thresh,
         nb_test=False,
+        de_emp=options.de_emp,
+        agc_gain=options.agc_gain,
+        compression=not options.ncomp,
+        sounddevice=options.sounddevice,
+        blocksize=options.blocksize,
+        ifreq=options.ifreq,
+        thresh=None,
+        quiet=True,
         S_meter=-1,
         sdt=0,
         tstamp=False,
@@ -198,6 +232,9 @@ def load_config(path):
             f.write("freq_major_khz  5\n")
             f.write("freq_minor_khz  1\n")
             f.write("window_height   %d\n" % DEFAULT_WINDOW_HEIGHT)
+            f.write("modulation      usb\n")
+            f.write("ncomp           false\n")
+            f.write("# sounddevice  name  -- run --ls-snd to list available sound devices\n")
     cfg = {}
     with open(path) as f:
         for line in f:
@@ -265,39 +302,31 @@ def save_sdr_list(path, sdrs):
 
 
 class RigctlPoller(threading.Thread):
-    """Polls a rigctld TCP port (a real hamlib rigctld talking to an actual radio,
-    or kiwiclientd's own emulation) for the current frequency, same as FreeDV does.
+    """Polls a rigctld TCP port (a real hamlib rigctld talking to an actual
+    radio, or any other rigctld) for the current frequency and mode, same as
+    FreeDV does, and reports both back via plain local callbacks every tick.
 
-    If mirror_target is given (host, port) of a second rigctld -- the locally
-    managed kiwiclientd's own rigctld -- also polls mode and relays both
-    frequency and mode there as SET commands on every tick. This is how
-    kiwiclientd's SDR audio channel stays tuned to match a real radio that's
-    the actual source of truth, since kiwiclientd has no way to follow an
-    external rigctld on its own -- its only tuning input is its own local
-    rigctld port.
+    Now that both the waterfall (LiveWFStream) and audio (LiveAudioStream)
+    connections live in-process, there's no separate process to relay
+    frequency/mode into -- the caller just calls their retune()/set_mode()
+    methods directly from these callbacks. Those methods already dedupe
+    against each stream's own current live freq/mode before sending
+    anything to the Kiwi, so this poller doesn't need to track "did it
+    change" itself.
     """
 
-    def __init__(self, host, port, on_freq_khz, poll_interval=0.5, mirror_target=None):
+    def __init__(self, host, port, on_freq_khz, on_mode=None, poll_interval=0.5):
         super().__init__(daemon=True)
         self._host = host
         self._port = port
         self._on_freq_khz = on_freq_khz
+        self._on_mode = on_mode
         self._poll_interval = poll_interval
-        self._mirror_target = mirror_target
         self._stop_event = threading.Event()
         self._recv_buf = ''
-        self._last_pushed = None
 
     def stop(self):
         self._stop_event.set()
-
-    def resync(self):
-        """Force the next tick to re-push F/M to the mirror even if unchanged --
-        call this right after the mirror's kiwiclientd has been (re)started, since
-        its freshly-spawned rigctld emulation won't have the current freq/mode yet
-        and the change-dedup in run() would otherwise wait for the next real
-        frequency/mode change before sending anything."""
-        self._last_pushed = None
 
     def _read_line(self, sock):
         # Proper line buffering: a single recv() can deliver more than one
@@ -312,16 +341,6 @@ class RigctlPoller(threading.Thread):
         line, self._recv_buf = self._recv_buf.split('\n', 1)
         return line.strip()
 
-    def _push_to_mirror(self, freq_hz, mode, passband_hz):
-        try:
-            with socket.create_connection(self._mirror_target, timeout=2) as s:
-                s.sendall(('F %d\n' % freq_hz).encode('ascii'))
-                if mode:
-                    cmd = ('M %s %d\n' % (mode, passband_hz)) if passband_hz else ('M %s\n' % mode)
-                    s.sendall(cmd.encode('ascii'))
-        except Exception as e:
-            logging.debug('rigctl mirror push failed: %s', e)
-
     def run(self):
         sock = None
         while not self._stop_event.is_set():
@@ -333,24 +352,14 @@ class RigctlPoller(threading.Thread):
                 freq_hz = float(self._read_line(sock))
                 self._on_freq_khz(freq_hz / 1000.0)
 
-                if self._mirror_target is not None:
+                if self._on_mode is not None:
                     sock.sendall(b'm\n')
                     mode = self._read_line(sock)
                     try:
                         passband_hz = int(self._read_line(sock))
                     except Exception:
                         passband_hz = None
-                    # Only push when something actually changed -- pushing
-                    # unconditionally every poll tick (previously every 0.5s)
-                    # made kiwiclientd's set_mod() re-send 'SET mod=...' to the
-                    # Kiwi just as often, which was retriggering a full audio
-                    # player teardown/rebuild (kiwiclientd.py's
-                    # _on_sample_rate_change -> _init_player) on every tick and
-                    # was the likely cause of FreeDV's audio dropping out.
-                    key = (round(freq_hz), mode, passband_hz)
-                    if key != self._last_pushed:
-                        self._push_to_mirror(freq_hz, mode, passband_hz)
-                        self._last_pushed = key
+                    self._on_mode(mode, passband_hz)
             except Exception as e:
                 logging.debug('rigctl poll error: %s', e)
                 if sock is not None:
@@ -371,7 +380,25 @@ class RigctlPoller(threading.Thread):
 
 
 class LiveWFStream(KiwiSDRStream):
-    """A single waterfall-only Kiwi connection that can be recentered on the fly."""
+    """A single waterfall-only Kiwi connection that can be recentered on the fly.
+
+    Kept as its own connection rather than merged onto LiveAudioStream's
+    SND-type connection: live testing (both against a Web888-family Kiwi and
+    a genuine KiwiSDR 2) showed the server never delivers W/F-tagged frames
+    on a connection opened as SND, no matter what zoom/wf_speed/wf_comp
+    commands are sent on it -- only a connection actually opened via the
+    '/W/F' URL path ever gets waterfall data. A camped second connection
+    (kiwi/client.py's `?camp` mechanism) does work for this on Kiwis with no
+    per-IP connection limit, but gains nothing there over two independent
+    connections, and is silently blocked at connection-admission time (~10s
+    then killed, no error) on Kiwis that only allow one connection per
+    source IP -- exactly the Kiwis (e.g. Wessex, KiwiSDR 2 firmware) this
+    was originally meant to help. That's a hard server-side wall with no
+    client-side workaround, so audio+waterfall together simply isn't
+    possible on such Kiwis; this and LiveAudioStream stay as two ordinary
+    independent connections, just both retuned in-process rather than one
+    of them living in a separately-spawned kiwiclientd subprocess.
+    """
 
     def __init__(self, options, initial_freq_khz, span_khz, row_queue):
         super().__init__()
@@ -430,6 +457,356 @@ class LiveWFStream(KiwiSDRStream):
                 self._row_queue.put_nowait(row)
             except queue.Full:
                 pass
+
+
+class LiveAudioStream(KiwiSDRStream):
+    """A single SND-type Kiwi connection: demodulated/IQ audio played to a
+    local sound device, with live retune/mode-change support driven by
+    rigctl polling. Runs in-process (its own thread pair via KiwiWorker)
+    alongside a separate LiveWFStream -- ported from kiwiclientd.py's
+    KiwiSoundRecorder so kiwipanadapter no longer needs to spawn
+    kiwiclientd.py as a subprocess or relay frequency/mode into it over a
+    mirrored local rigctld; this object is just retuned/remoded directly.
+    """
+
+    def __init__(self, options, initial_freq_khz, modulation, lowcut, highcut):
+        super().__init__()
+        self._options = options
+        self._type = 'SND'
+        self._freq_offset = 0
+        self._freq = initial_freq_khz
+        self._pending_freq = None
+        self._pending_mode = None
+        self._lock = threading.Lock()
+
+        # Live demod mode -- unlike a static CLI-driven recorder, this is
+        # meant to be updated at runtime (set_mode()) as a real rig's rigctld
+        # reports mode changes, so it's kept as plain instance state rather
+        # than read from self._options each time.
+        self._modulation = modulation
+        self._lowcut = lowcut
+        self._highcut = highcut
+
+        self._ifreq = options.ifreq
+        self._start_ts = None
+        self._start_time = None
+        self._resampler = None
+        self._output_sample_rate = 0
+
+        # Audio queue for non-blocking playback
+        self._audio_queue = Queue(maxsize=10)
+        self._playback_thread = None
+        self._playback_running = False
+        self._pending_audio = None
+
+        # Playback rate adjustment tracking
+        self._pending_audio_history = []
+        self._playback_rate_adjustment = 1.0
+        self._last_rate_check_time = None
+
+    # -- retuning: replaces the old separate-process rigctld-mirror RPC.
+    # Both pending values are drained and applied together in
+    # _process_audio_samples (the connection's single reader thread),
+    # comparing against the stream's current live freq/mode -- this is what
+    # dedupes redundant re-sends now that there's no second process that
+    # needs an explicit resync after a restart. --------------------------
+
+    def retune(self, freq_khz):
+        with self._lock:
+            self._pending_freq = freq_khz
+
+    def set_mode(self, mod, passband_hz):
+        if mod:
+            mod = mod.lower()
+            if mod == 'pktusb':
+                # FreeDV/hamlib may request Icom-style "packet over USB",
+                # which KiwiSDR has no concept of -- treat it as plain USB
+                # (same fix as kiwi/rigctld.py's _set_modulation).
+                mod = 'usb'
+        with self._lock:
+            self._pending_mode = (mod, passband_hz)
+
+    def _apply_pending_retune(self):
+        with self._lock:
+            pending_freq = self._pending_freq
+            self._pending_freq = None
+            pending_mode = self._pending_mode
+            self._pending_mode = None
+
+        mode_changed = False
+        if pending_mode is not None:
+            mod, passband_hz = pending_mode
+            if mod and (mod != self._modulation or passband_hz != self._highcut):
+                self._modulation = mod
+                self._lowcut = None
+                self._highcut = passband_hz
+                mode_changed = True
+
+        freq_changed = pending_freq is not None and pending_freq != self._freq
+        if freq_changed:
+            self._freq = pending_freq
+
+        if freq_changed or mode_changed:
+            try:
+                lowcut = self._lowcut
+                if self._modulation == 'am':
+                    lowcut = -self._highcut if lowcut is not None else lowcut
+                self.set_mod(self._modulation, lowcut, self._highcut, self._freq)
+            except Exception as e:
+                logging.debug('audio retune failed: %s', e)
+
+    def _update_playback_rate_adjustment(self):
+        """Adjust playback rate based on pending buffer accumulation."""
+        current_time = time.time()
+        if self._last_rate_check_time is None or (current_time - self._last_rate_check_time) < 2.0:
+            return
+        self._last_rate_check_time = current_time
+
+        pending_size = len(self._pending_audio) if self._pending_audio is not None else 0
+        self._pending_audio_history.append(pending_size)
+        if len(self._pending_audio_history) > 10:
+            self._pending_audio_history.pop(0)
+        if len(self._pending_audio_history) < 3:
+            return
+
+        recent_avg = sum(self._pending_audio_history[-3:]) / 3.0
+        older_avg = sum(self._pending_audio_history[-6:-3]) / 3.0 if len(self._pending_audio_history) >= 6 else recent_avg
+        pending_seconds = pending_size / (self._output_sample_rate * 2) if pending_size > 0 else 0
+
+        if recent_avg > older_avg * 1.2 and pending_seconds > 0.5:
+            self._playback_rate_adjustment = min(1.005, self._playback_rate_adjustment + 0.001)
+            logging.info("Playback rate adjustment: %.4f (buffer: %.2fs, growing)" %
+                        (self._playback_rate_adjustment, pending_seconds))
+        elif recent_avg < older_avg * 0.8 and self._playback_rate_adjustment > 1.0:
+            self._playback_rate_adjustment = max(1.0, self._playback_rate_adjustment - 0.001)
+            logging.info("Playback rate adjustment: %.4f (buffer: %.2fs, shrinking)" %
+                        (self._playback_rate_adjustment, pending_seconds))
+
+    def _queue_audio(self, samples):
+        """Queue audio samples for non-blocking playback. Accumulates if queue is full."""
+        self._update_playback_rate_adjustment()
+
+        if self._playback_rate_adjustment != 1.0:
+            try:
+                if HAS_RESAMPLER:
+                    if not hasattr(self, '_playback_resampler'):
+                        channels = 1 if len(samples.shape) == 1 else samples.shape[1]
+                        self._playback_resampler = Resampler(channels=channels, converter_type='sinc_fastest')
+                    samples = self._playback_resampler.process(samples, ratio=self._playback_rate_adjustment)
+                else:
+                    n = len(samples)
+                    ratio = self._playback_rate_adjustment
+                    xa = np.arange(round(n * ratio)) / ratio
+                    xp = np.arange(n)
+                    if len(samples.shape) == 1:
+                        samples = np.interp(xa, xp, samples).astype(samples.dtype)
+                    else:
+                        new_samples = np.zeros((len(xa), samples.shape[1]), dtype=samples.dtype)
+                        for ch in range(samples.shape[1]):
+                            new_samples[:, ch] = np.interp(xa, xp, samples[:, ch])
+                        samples = new_samples
+            except Exception as e:
+                logging.error("Playback rate adjustment failed: %s" % e)
+
+        if self._pending_audio is not None:
+            self._pending_audio = np.concatenate((self._pending_audio, samples), axis=0)
+        else:
+            self._pending_audio = samples
+
+        chunk_size = 8192
+        while self._pending_audio is not None and len(self._pending_audio) > 0:
+            if len(self._pending_audio) <= chunk_size:
+                chunk = self._pending_audio
+                remaining = None
+            else:
+                chunk = self._pending_audio[:chunk_size]
+                remaining = self._pending_audio[chunk_size:]
+            try:
+                self._audio_queue.put(chunk, block=False)
+                self._pending_audio = remaining
+            except Exception:
+                break
+
+    def _playback_thread_func(self):
+        """Separate thread for audio playback to avoid blocking rigctl retuning."""
+        while self._playback_running:
+            try:
+                samples = self._audio_queue.get(timeout=0.1)
+                if samples is not None:
+                    self._player.play(samples)
+            except Empty:
+                continue
+            except Exception as e:
+                logging.error("Playback error: %s" % e)
+
+    def _init_player(self):
+        if hasattr(self, '_player'):
+            self._player.__exit__(exc_type=None, exc_value=None, traceback=None)
+        options = self._options
+        speaker = sc.get_speaker(options.sounddevice)
+        rate = self._output_sample_rate
+        if speaker is None:
+            if not options.sounddevice:
+                logging.warning('Using default sound device. Specify --snddev?')
+            else:
+                logging.warning('Could not find sound device "%s", using default', options.sounddevice)
+            speaker = sc.default_speaker()
+
+        # pulseaudio has sporadic failures, retry a few times
+        for i in range(0, 10):
+            try:
+                # Small blocksize to avoid long blocking in play() which delays retunes
+                self._player = speaker.player(samplerate=rate, blocksize=self._options.blocksize)
+                self._player.__enter__()
+                break
+            except Exception as ex:
+                logging.warning('speaker.player failed with %s', ex)
+                time.sleep(0.1)
+
+        if self._playback_running:
+            self._playback_running = False
+            if self._playback_thread:
+                self._playback_thread.join(timeout=1.0)
+
+        self._playback_running = True
+        self._playback_thread = threading.Thread(target=self._playback_thread_func, daemon=True)
+        self._playback_thread.start()
+
+    def _setup_rx_params(self):
+        self.set_name(self._options.user)
+
+        lowcut = self._lowcut
+        if self._modulation == 'am':
+            # For AM, ignore the low pass filter cutoff
+            lowcut = -self._highcut if lowcut is not None else lowcut
+        self.set_mod(self._modulation, lowcut, self._highcut, self._freq)
+        if self._options.agc_gain is not None:
+            self.set_agc(on=False, gain=self._options.agc_gain)
+        else:
+            self.set_agc(on=True)
+        if self._options.compression is False:
+            self._set_snd_comp(False)
+        if self._options.nb is True:
+            gate = self._options.nb_gate
+            if gate < 100 or gate > 5000:
+                gate = 100
+            thresh = self._options.nb_thresh
+            if thresh < 0 or thresh > 100:
+                thresh = 50
+            self.set_noise_blanker(gate, thresh)
+        if self._options.de_emp is True:
+            self.set_de_emp(1)
+        self._output_sample_rate = int(self._sample_rate)
+        if self._options.resample > 0:
+            self._output_sample_rate = self._options.resample
+            self._ratio = float(self._output_sample_rate) / self._sample_rate
+            logging.info('resampling from %g to %d Hz (ratio=%f)' % (self._sample_rate, self._options.resample, self._ratio))
+            if not HAS_RESAMPLER:
+                logging.info("libsamplerate not available: linear interpolation is used for low-quality resampling. "
+                             "(pip/pip3 install samplerate)")
+        if self._ifreq is not None:
+            if self._modulation != 'iq':
+                logging.warning('Option --if %.1f only valid for IQ modulation, ignored' % self._ifreq)
+            elif self._output_sample_rate < self._ifreq * 4:
+                logging.warning('Sample rate %.1f is not enough for --if %.1f, ignored. Use --resample %.1f' % (
+                    self._output_sample_rate, self._ifreq, self._ifreq * 4))
+        self._init_player()
+
+    def _process_audio_samples(self, seq, samples, rssi, fmt):
+        self._apply_pending_retune()
+        drift_correction = self._track_sample_rate_drift(len(samples))
+
+        if self._options.resample > 0:
+            corrected_ratio = self._ratio * drift_correction
+            if HAS_RESAMPLER:
+                if self._resampler is None:
+                    self._resampler = Resampler(converter_type='sinc_best')
+                samples = np.round(self._resampler.process(samples, ratio=corrected_ratio)).astype(np.int16)
+            else:
+                n = len(samples)
+                xa = np.arange(round(n * corrected_ratio)) / corrected_ratio
+                xp = np.arange(n)
+                samples = np.round(np.interp(xa, xp, samples)).astype(np.int16)
+
+        fsamples = samples.astype(np.float32)
+        fsamples /= 32768
+        self._queue_audio(fsamples)
+
+    def _process_stereo_samples_raw(self, seq, data):
+        self._apply_pending_retune()
+        n = len(data) // 4
+
+        if self._options.resample == 0 or HAS_RESAMPLER:
+            s = np.ndarray((n, 2), dtype='>h', buffer=data).astype(np.float32) / 32768
+
+        if self._options.resample > 0:
+            if HAS_RESAMPLER:
+                if self._resampler is None:
+                    self._resampler = Resampler(channels=2, converter_type='sinc_best')
+                s = self._resampler.process(s, ratio=self._ratio)
+            else:
+                m = int(round(n * self._ratio))
+                xa = np.arange(m) / self._ratio
+                xp = np.arange(n)
+                s = np.ndarray((m, 2), dtype=np.float32)
+                s[:, 0] = np.interp(xa, xp, data[0::2] / 32768)
+                s[:, 1] = np.interp(xa, xp, data[1::2] / 32768)
+
+        if self._ifreq is not None and self._output_sample_rate >= 4 * self._ifreq:
+            cs = s.view(dtype=np.complex64)
+            l = len(cs)
+            stopph = self.startph + 2 * np.pi * l * self._ifreq / self._output_sample_rate
+            steps = 1j * np.linspace(self.startph, stopph, l, endpoint=False, dtype=np.float32)
+            s = (cs * np.exp(steps)[:, None]).view(np.float32)
+            self.startph = stopph % (2 * np.pi)
+
+        self._queue_audio(s)
+
+    # phase for frequency shift
+    startph = np.float32(0)
+
+    def _process_iq_samples(self, seq, samples, rssi, gps, fmt):
+        self._apply_pending_retune()
+        if self._options.resample == 0 or HAS_RESAMPLER:
+            s = np.ndarray((len(samples), 2), dtype=np.float32)
+            s[:, 0] = np.real(samples).astype(np.float32) / 32768
+            s[:, 1] = np.imag(samples).astype(np.float32) / 32768
+
+        if self._options.resample > 0:
+            if HAS_RESAMPLER:
+                if self._resampler is None:
+                    self._resampler = Resampler(channels=2, converter_type='sinc_best')
+                s = self._resampler.process(s, ratio=self._ratio)
+            else:
+                n = len(samples)
+                m = int(round(n * self._ratio))
+                xa = np.arange(m) / self._ratio
+                xp = np.arange(n)
+                s = np.ndarray((m, 2), dtype=np.float32)
+                s[:, 0] = np.interp(xa, xp, np.real(samples).astype(np.float32) / 32768)
+                s[:, 1] = np.interp(xa, xp, np.imag(samples).astype(np.float32) / 32768)
+
+        if self._ifreq is not None and self._output_sample_rate >= 4 * self._ifreq:
+            cs = s.view(dtype=np.complex64)
+            l = len(cs)
+            stopph = self.startph + 2 * np.pi * l * self._ifreq / self._output_sample_rate
+            steps = 1j * np.linspace(self.startph, stopph, l, endpoint=False, dtype=np.float32)
+            s = (cs * np.exp(steps)[:, None]).view(np.float32)
+            self.startph = stopph % (2 * np.pi)
+
+        self._queue_audio(s)
+
+    def _on_sample_rate_change(self):
+        if self._options.resample == 0:
+            if self._output_sample_rate == int(self._sample_rate):
+                # Rate genuinely unchanged -- don't tear down and rebuild the
+                # audio player (new PipeWire/sound device node, restarted
+                # playback thread) just because the Kiwi re-sent a
+                # 'sample_rate' message, e.g. in response to a redundant
+                # 'SET mod=...' triggered by a repeated rigctl mode-set.
+                return
+            self._output_sample_rate = int(self._sample_rate)
+            self._init_player()
 
 
 class SdrEntryDialog(tk.Toplevel):
@@ -584,6 +961,9 @@ class PanadapterApp:
         self._worker = None
         self._run_event = None
         self._wf_stream = None
+        self._audio_worker = None
+        self._audio_run_event = None
+        self._audio_stream = None
         self._last_signal_dbm = None
         self._smeter_dbm = None
         self._smeter_last_ts = None
@@ -592,23 +972,14 @@ class PanadapterApp:
         self._smeter_peak_last_ts = None
         self._last_start = None
         self._last_stop = None
-        self._kiwiclientd_proc = None
         self._active_sdr = None
 
         root.title('Kiwi Panadapter')
         self._build_ui()
         root.update_idletasks()   # so winfo_width/height are accurate before the first row arrives
 
-        if not self._options.no_kiwiclientd:
-            self._start_kiwiclientd(self._initial_sdr)
-
-        mirror_target = None
-        if not self._options.no_kiwiclientd:
-            kiwiclientd_target = ('127.0.0.1', self._options.kiwiclientd_rigctl_port)
-            if (options.rigctl_host, options.rigctl_port) != kiwiclientd_target:
-                mirror_target = kiwiclientd_target
-        self._rigctl_poller = RigctlPoller(options.rigctl_host, options.rigctl_port, self._on_rigctl_freq,
-                                            mirror_target=mirror_target)
+        self._rigctl_poller = RigctlPoller(options.rigctl_host, options.rigctl_port,
+                                            self._on_rigctl_freq, on_mode=self._on_rigctl_mode)
         self._rigctl_poller.start()
 
         self._start_stream(self._initial_sdr)
@@ -673,29 +1044,50 @@ class PanadapterApp:
     # -- SDR connection management -------------------------------------------------
 
     def _start_stream(self, sdr_entry):
-        opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options.user)
         with self._freq_lock:
             freq = self._current_freq_khz if self._current_freq_khz is not None else self._options.default_freq
-        self._wf_stream = LiveWFStream(opt, freq, self._options.span, self._row_queue)
+
+        wf_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options, ws_offset=0)
+        self._wf_stream = LiveWFStream(wf_opt, freq, self._options.span, self._row_queue)
         self._run_event = threading.Event()
         self._run_event.set()
-        camp_wait_event = threading.Event()
-        camp_wait_event.set()
-        self._worker = KiwiWorker(args=(self._wf_stream, opt, True, False, self._run_event, camp_wait_event))
+        wf_camp_wait_event = threading.Event()
+        wf_camp_wait_event.set()
+        self._worker = KiwiWorker(args=(self._wf_stream, wf_opt, True, False, self._run_event, wf_camp_wait_event))
         self._worker.start()
+
+        audio_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options, ws_offset=1)
+        self._audio_stream = LiveAudioStream(audio_opt, freq, self._options.modulation,
+                                              self._options.lp_cut, self._options.hp_cut)
+        self._audio_run_event = threading.Event()
+        self._audio_run_event.set()
+        audio_camp_wait_event = threading.Event()
+        audio_camp_wait_event.set()
+        self._audio_worker = KiwiWorker(args=(self._audio_stream, audio_opt, True, False,
+                                               self._audio_run_event, audio_camp_wait_event))
+        self._audio_worker.start()
+
         self._status_var.set('connecting to %s...' % sdr_entry['name'])
 
     def _stop_stream(self):
-        if self._worker is None:
-            return
-        self._run_event.clear()
-        try:
-            self._wf_stream.close()
-        except Exception:
-            pass
-        self._worker.join(timeout=2)
-        self._worker = None
-        self._wf_stream = None
+        if self._worker is not None:
+            self._run_event.clear()
+            try:
+                self._wf_stream.close()
+            except Exception:
+                pass
+            self._worker.join(timeout=2)
+            self._worker = None
+            self._wf_stream = None
+        if self._audio_worker is not None:
+            self._audio_run_event.clear()
+            try:
+                self._audio_stream.close()
+            except Exception:
+                pass
+            self._audio_worker.join(timeout=2)
+            self._audio_worker = None
+            self._audio_stream = None
 
     def _on_sdr_change(self, _event):
         name = self._sdr_var.get()
@@ -715,9 +1107,6 @@ class PanadapterApp:
         self._smeter_peak_set_ts = None
         self._smeter_peak_last_ts = None
         self._wf_auto_floor_dbm = None
-        if not self._options.no_kiwiclientd:
-            self._start_kiwiclientd(entry)
-            self._rigctl_poller.resync()
         self._start_stream(entry)
         self._active_sdr = entry
         try:
@@ -740,50 +1129,21 @@ class PanadapterApp:
         if entry is not None and entry != self._active_sdr:
             self._on_sdr_change(None)
 
-    # -- kiwiclientd lifecycle --------------------------------------------------------
-
-    def _start_kiwiclientd(self, sdr_entry):
-        self._stop_kiwiclientd()
-        # Always bound to a local port dedicated to the managed kiwiclientd, distinct
-        # from rigctl_host/rigctl_port (which may point at a real rigctld elsewhere,
-        # e.g. talking to an actual radio) -- kiwipanadapter itself is the only
-        # client of this port, relaying the true frequency/mode into it so
-        # kiwiclientd's SDR audio channel stays tuned to match (see RigctlPoller's
-        # mirror_target).
-        argv = [sys.executable, self._options.kiwiclientd_path,
-                '-s', sdr_entry['host'], '-p', str(sdr_entry['port']),
-                '--rigctl-addr', '127.0.0.1',
-                '--rigctl-port', str(self._options.kiwiclientd_rigctl_port),
-                '--enable-rigctl']
-        if self._options.kiwiclientd_args:
-            argv += shlex.split(self._options.kiwiclientd_args)
-        logging.info('starting kiwiclientd: %s', ' '.join(argv))
-        try:
-            self._kiwiclientd_proc = subprocess.Popen(argv, cwd=SCRIPT_DIR)
-        except Exception as e:
-            logging.error('failed to start kiwiclientd: %s', e)
-            self._kiwiclientd_proc = None
-
-    def _stop_kiwiclientd(self):
-        if self._kiwiclientd_proc is None:
-            return
-        proc = self._kiwiclientd_proc
-        self._kiwiclientd_proc = None
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=2)
-
-    # -- frequency tracking ---------------------------------------------------------
+    # -- frequency/mode tracking ------------------------------------------------------
 
     def _on_rigctl_freq(self, freq_khz):
         with self._freq_lock:
             changed = self._current_freq_khz != freq_khz
             self._current_freq_khz = freq_khz
-        if changed and self._wf_stream is not None:
-            self._wf_stream.retune(freq_khz)
+        if changed:
+            if self._wf_stream is not None:
+                self._wf_stream.retune(freq_khz)
+            if self._audio_stream is not None:
+                self._audio_stream.retune(freq_khz)
+
+    def _on_rigctl_mode(self, mode, passband_hz):
+        if self._audio_stream is not None:
+            self._audio_stream.set_mode(mode, passband_hz)
 
     # -- GUI update loop --------------------------------------------------------------
 
@@ -1002,7 +1362,6 @@ class PanadapterApp:
             logging.debug('failed to save window geometry: %s', e)
         self._rigctl_poller.stop()
         self._stop_stream()
-        self._stop_kiwiclientd()
         self._root.destroy()
 
 
@@ -1016,9 +1375,9 @@ def parse_args():
 
     p = argparse.ArgumentParser(description=__doc__, parents=[pre])
     p.add_argument('--rigctl-host', default=cfg.get('rigctl_host', '127.0.0.1'),
-                    help='kiwiclientd rigctld host (config: rigctl_host, default 127.0.0.1)')
+                    help='rigctld host to follow for frequency/mode, same as FreeDV (config: rigctl_host, default 127.0.0.1)')
     p.add_argument('--rigctl-port', type=int, default=cfg.get('rigctl_port', 6400),
-                    help='kiwiclientd rigctld port (config: rigctl_port, default 6400)')
+                    help='rigctld port to follow for frequency/mode (config: rigctl_port, default 6400)')
     p.add_argument('--span', dest='span', type=float, default=cfg.get('span_khz', 50.0),
                     help='total span in kHz shown, centered on the tracked frequency (config: span_khz, default 50 = +/-25kHz)')
     p.add_argument('--mindb', type=float, default=cfg.get('mindb', -120.0),
@@ -1083,27 +1442,52 @@ def parse_args():
     p.add_argument('--user', default='kiwipanadapter', help='client name reported to the Kiwi')
     p.add_argument('--default-freq', dest='default_freq', type=float, default=cfg.get('default_freq', 14200.0),
                     help='initial center frequency (kHz) used until the first rigctl poll arrives (config: default_freq)')
-    p.add_argument('--kiwiclientd-path', dest='kiwiclientd_path',
-                    default=cfg.get('kiwiclientd_path', os.path.join(SCRIPT_DIR, 'kiwiclientd.py')),
-                    help='path to kiwiclientd.py, started/restarted automatically for the selected SDR (config: kiwiclientd_path)')
-    p.add_argument('--kiwiclientd-args', dest='kiwiclientd_args', default=cfg.get('kiwiclientd_args', ''),
-                    help='extra arguments appended to the managed kiwiclientd invocation, e.g. "--snddev kiwisnd0" (config: kiwiclientd_args)')
-    p.add_argument('--kiwiclientd-rigctl-port', dest='kiwiclientd_rigctl_port', type=int,
-                    default=cfg.get('kiwiclientd_rigctl_port', 6400),
-                    help='local port the managed kiwiclientd binds its own rigctld emulation to (always '
-                         '127.0.0.1) -- kept separate from rigctl_host/rigctl_port so that can point at a '
-                         'real rigctld elsewhere; kiwipanadapter relays the true frequency/mode into this '
-                         'port so kiwiclientd\'s SDR audio channel stays tuned to match (config: kiwiclientd_rigctl_port)')
-    p.add_argument('--no-kiwiclientd', dest='no_kiwiclientd', action='store_true',
-                    default=cfg.get('no_kiwiclientd', False),
-                    help="don't start/manage kiwiclientd at all -- use this only if you don't want an "
-                         "SDR audio node available (config: no_kiwiclientd)")
+    p.add_argument('--modulation', default=cfg.get('modulation', 'usb'),
+                    help='demodulation mode used for local audio playback until the first rigctl mode '
+                         'update arrives -- am/amn/amw/sam/lsb/lsn/usb/usn/cw/cwn/nbfm/nnfm/iq etc '
+                         '(config: modulation, default usb)')
+    p.add_argument('--snddev', '--sound-device', dest='sounddevice', default=cfg.get('sounddevice', ''),
+                    help='sound device to play Kiwi audio on, e.g. a virtual sink name -- run --ls-snd to '
+                         'list available devices (config: sounddevice)')
+    p.add_argument('--ls-snd', '--list-sound-devices', dest='list_sound_devices', action='store_true',
+                    default=False, help='list available sound devices and exit')
+    p.add_argument('--ncomp', '--no-compression', dest='ncomp', action='store_true',
+                    default=cfg.get('ncomp', False),
+                    help="don't use audio compression -- better quality for a data-mode decoder like FreeDV, "
+                         "at the cost of ~2x audio bandwidth to the Kiwi (config: ncomp, default false)")
+    p.add_argument('-L', '--lp-cut', dest='lp_cut', type=float, default=cfg.get('lp_cut', None),
+                    help='low-pass cutoff frequency, in Hz -- overridden by any live rigctl mode/passband '
+                         'update once one arrives (config: lp_cut)')
+    p.add_argument('-H', '--hp-cut', dest='hp_cut', type=float, default=cfg.get('hp_cut', None),
+                    help='high-pass cutoff frequency, in Hz -- overridden by any live rigctl mode/passband '
+                         'update once one arrives (config: hp_cut)')
+    p.add_argument('-g', '--agc-gain', dest='agc_gain', type=float, default=cfg.get('agc_gain', None),
+                    help='AGC gain; if set, AGC is turned off (config: agc_gain)')
+    p.add_argument('--blocksize', dest='blocksize', type=int, default=cfg.get('blocksize', 512),
+                    help='sound player blocksize in frames -- kept small so play() doesn\'t block retunes '
+                         'for long (config: blocksize, default 512)')
+    p.add_argument('--nb', dest='nb', action='store_true', default=cfg.get('nb', False),
+                    help='enable noise blanker with default parameters (config: nb)')
+    p.add_argument('--nb-gate', dest='nb_gate', type=int, default=cfg.get('nb_gate', 100),
+                    help='noise blanker gate time in usec, 100-5000 (config: nb_gate, default 100)')
+    p.add_argument('--nb-thresh', dest='nb_thresh', type=int, default=cfg.get('nb_thresh', 50),
+                    help='noise blanker threshold in percent, 0-100 (config: nb_thresh, default 50)')
+    p.add_argument('--de-emp', dest='de_emp', action='store_true', default=cfg.get('de_emp', False),
+                    help='enable de-emphasis (config: de_emp)')
+    p.add_argument('--resample', dest='resample', type=int, default=cfg.get('resample', 0),
+                    help='resample audio output to this rate in Hz, 0 = no resampling (config: resample)')
+    p.add_argument('--if', dest='ifreq', type=float, default=cfg.get('ifreq', None),
+                    help='intermediate frequency shift in Hz, only valid with modulation=iq -- for '
+                         'IQ-in/IQ-out workflows such as feeding raw I/Q into FreeDV transmit (config: ifreq)')
     p.add_argument('--log-level', default='warn', choices=['debug', 'info', 'warn', 'error'])
     return p.parse_args()
 
 
 def main():
     options = parse_args()
+    if options.list_sound_devices:
+        print(sc.all_speakers())
+        return
     logging.basicConfig(level=logging.getLevelName(options.log_level.upper()),
                          format='%(asctime)-15s %(message)s')
     root = tk.Tk()
