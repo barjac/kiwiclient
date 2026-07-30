@@ -298,6 +298,23 @@ def save_config_value(path, key, value):
         f.writelines(lines)
 
 
+def _parse_sdr_tokens(parts):
+    """parts: whitespace-split tokens of 'name... host port [mimic_browser]'.
+    Returns (name, host, port, mimic_browser) or None if it doesn't parse."""
+    if len(parts) < 2:
+        return None
+    mimic_browser = False
+    if not parts[-1].lstrip('-').isdigit():
+        mimic_browser = parts[-1] == 'mimic_browser'
+        parts = parts[:-1]
+    if len(parts) < 2 or not parts[-1].lstrip('-').isdigit():
+        return None
+    host = parts[-2]
+    port = int(parts[-1])
+    name = ' '.join(parts[:-2]) if len(parts) > 2 else host
+    return name, host, port, mimic_browser
+
+
 def load_sdr_list(path):
     """Flat text file: 'name host port [mimic_browser]' per line, '#' comments,
     blank lines ignored. The optional trailing 'mimic_browser' flag is for
@@ -305,7 +322,14 @@ def load_sdr_list(path):
     single-IP-restricted KiwiSDRs) but do allow a browser's own two
     connections -- when set, both the waterfall and audio connections to
     that SDR present themselves with a real browser's headers/URL path
-    instead of this client's normal bare handshake."""
+    instead of this client's normal bare handshake.
+
+    A whole line starting with '#' that still parses as a valid entry (once
+    the '#' is stripped) is a *disabled* entry -- kept out of the main SDR
+    selector but still shown (and re-enable/disable-toggleable) in the
+    Manage... dialog, so an SDR can be temporarily hidden without deleting
+    it and losing its host/port. An ordinary comment (the header line, or
+    anything that doesn't parse as an entry) is just a comment, as before."""
     if not os.path.exists(path):
         with open(path, 'w') as f:
             f.write("# name              host                     port    [mimic_browser]\n")
@@ -313,34 +337,41 @@ def load_sdr_list(path):
     sdrs = []
     with open(path) as f:
         for line in f:
-            line = line.split('#', 1)[0].strip()
-            if not line:
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            mimic_browser = False
-            if not parts[-1].lstrip('-').isdigit():
-                mimic_browser = parts[-1] == 'mimic_browser'
-                parts = parts[:-1]
-            if len(parts) < 2:
-                continue
-            host = parts[-2]
-            port = int(parts[-1])
-            name = ' '.join(parts[:-2]) if len(parts) > 2 else host
-            sdrs.append({'name': name, 'host': host, 'port': port, 'mimic_browser': mimic_browser})
+            stripped = line.strip()
+            disabled = False
+            content = stripped
+            if content.startswith('#'):
+                candidate = content[1:].strip()
+                parsed = _parse_sdr_tokens(candidate.split())
+                if parsed is None:
+                    continue   # an ordinary comment/header line
+                disabled = True
+                name, host, port, mimic_browser = parsed
+            else:
+                content = content.split('#', 1)[0].strip()
+                if not content:
+                    continue
+                parsed = _parse_sdr_tokens(content.split())
+                if parsed is None:
+                    continue
+                name, host, port, mimic_browser = parsed
+            sdrs.append({'name': name, 'host': host, 'port': port,
+                         'mimic_browser': mimic_browser, 'disabled': disabled})
     return sdrs
 
 
 def save_sdr_list(path, sdrs):
-    """Rewrite the flat 'name host port [mimic_browser]' file from an in-memory list."""
+    """Rewrite the flat 'name host port [mimic_browser]' file from an in-memory
+    list. A disabled entry is written back as a '#'-commented line (still a
+    valid entry, just hidden from the selector -- see load_sdr_list)."""
     name_w = max((len(s['name']) for s in sdrs), default=4) + 2
     host_w = max((len(s['host']) for s in sdrs), default=4) + 2
     with open(path, 'w') as f:
         f.write("# name              host                     port    [mimic_browser]\n")
         for s in sdrs:
             suffix = '  mimic_browser' if s.get('mimic_browser') else ''
-            f.write("%-*s %-*s %s%s\n" % (name_w, s['name'], host_w, s['host'], s['port'], suffix))
+            prefix = '# ' if s.get('disabled') else ''
+            f.write("%s%-*s %-*s %s%s\n" % (prefix, name_w, s['name'], host_w, s['host'], s['port'], suffix))
 
 
 class RigctlPoller(threading.Thread):
@@ -927,6 +958,7 @@ class SdrEntryDialog(tk.Toplevel):
         self._host_var = tk.StringVar(value=entry['host'] if entry else '')
         self._port_var = tk.StringVar(value=str(entry['port']) if entry else '')
         self._mimic_var = tk.BooleanVar(value=bool(entry.get('mimic_browser')) if entry else False)
+        self._disabled_var = tk.BooleanVar(value=bool(entry.get('disabled')) if entry else False)
 
         form = ttk.Frame(self)
         form.pack(padx=8, pady=8)
@@ -936,6 +968,8 @@ class SdrEntryDialog(tk.Toplevel):
             ttk.Entry(form, textvariable=var, width=28).grid(row=row, column=1, pady=2)
         ttk.Checkbutton(form, text='Mimic browser (for single-IP-restricted Kiwis)',
                          variable=self._mimic_var).grid(row=len(fields), column=0, columnspan=2, sticky='w', pady=(4, 0))
+        ttk.Checkbutton(form, text='Disabled (hide from SDR selector, keep in this list)',
+                         variable=self._disabled_var).grid(row=len(fields) + 1, column=0, columnspan=2, sticky='w')
 
         btns = ttk.Frame(self)
         btns.pack(pady=(0, 8))
@@ -952,9 +986,21 @@ class SdrEntryDialog(tk.Toplevel):
             port = int(self._port_var.get().strip())
         except ValueError:
             return
+        disabled = self._disabled_var.get()
+        # A leading '#' typed directly into the name (matching the
+        # sdr_list.txt file convention this dialog is a GUI for) is treated
+        # the same as ticking the Disabled checkbox, not left as literal
+        # name text -- otherwise the saved file and the in-memory entry
+        # disagree (name still starts with '#' but disabled stays False),
+        # and reloading the file would silently strip the '#' and flip
+        # disabled to True, changing both the name and the flag.
+        if name.startswith('#'):
+            name = name[1:].strip()
+            disabled = True
         if not name or not host:
             return
-        self.result = {'name': name, 'host': host, 'port': port, 'mimic_browser': self._mimic_var.get()}
+        self.result = {'name': name, 'host': host, 'port': port,
+                       'mimic_browser': self._mimic_var.get(), 'disabled': disabled}
         self.destroy()
 
 
@@ -986,7 +1032,8 @@ class SdrListDialog(tk.Toplevel):
         self._listbox.delete(0, 'end')
         for s in self._sdr_list:
             mimic = '  [mimic browser]' if s.get('mimic_browser') else ''
-            self._listbox.insert('end', '%s  (%s:%s)%s' % (s['name'], s['host'], s['port'], mimic))
+            disabled = '  [disabled]' if s.get('disabled') else ''
+            self._listbox.insert('end', '%s  (%s:%s)%s%s' % (s['name'], s['host'], s['port'], mimic, disabled))
 
     def _save(self):
         save_sdr_list(self._list_path, self._sdr_list)
@@ -1027,7 +1074,10 @@ class PanadapterApp:
         self._sdr_list = load_sdr_list(options.sdr_list)
         if not self._sdr_list:
             raise Exception('No SDRs in %s -- add at least one "name host port" line' % options.sdr_list)
-        self._initial_sdr = next((s for s in self._sdr_list if s['name'] == options.last_sdr), self._sdr_list[0])
+        enabled_sdrs = self._enabled_sdrs()
+        if not enabled_sdrs:
+            raise Exception('All SDRs in %s are disabled -- enable at least one' % options.sdr_list)
+        self._initial_sdr = next((s for s in enabled_sdrs if s['name'] == options.last_sdr), enabled_sdrs[0])
 
         self._mindb = options.mindb
         self._maxdb = options.maxdb
@@ -1117,7 +1167,7 @@ class PanadapterApp:
         combo_width = max((len(s['name']) for s in self._sdr_list), default=10) + 2
         self._sdr_combo = ttk.Combobox(top, textvariable=self._sdr_var, state='readonly',
                                         width=combo_width,
-                                        values=[s['name'] for s in self._sdr_list])
+                                        values=[s['name'] for s in self._enabled_sdrs()])
         self._sdr_combo.pack(side='left', padx=4)
         self._sdr_combo.bind('<<ComboboxSelected>>', self._on_sdr_change)
         ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left')
@@ -1311,17 +1361,21 @@ class PanadapterApp:
         except Exception as e:
             logging.debug('failed to save last_sdr: %s', e)
 
+    def _enabled_sdrs(self):
+        return [s for s in self._sdr_list if not s.get('disabled')]
+
     def _open_sdr_manager(self):
         SdrListDialog(self._root, self._sdr_list, self._options.sdr_list, self._on_sdr_list_changed)
 
     def _on_sdr_list_changed(self):
-        names = [s['name'] for s in self._sdr_list]
+        enabled = self._enabled_sdrs()
+        names = [s['name'] for s in enabled]
         self._sdr_combo['values'] = names
         self._sdr_combo.config(width=max((len(n) for n in names), default=10) + 2)
         current_name = self._sdr_var.get()
-        entry = next((s for s in self._sdr_list if s['name'] == current_name), None)
-        if entry is None and self._sdr_list:
-            entry = self._sdr_list[0]
+        entry = next((s for s in enabled if s['name'] == current_name), None)
+        if entry is None and enabled:
+            entry = enabled[0]
             self._sdr_var.set(entry['name'])
         if entry is not None and entry != self._active_sdr:
             self._on_sdr_change(None)
@@ -1507,12 +1561,12 @@ class PanadapterApp:
 
         for f in tick_positions(start_khz, stop_khz, self._freq_minor_khz):
             x = int((f - start_khz) / span * w)
-            c.create_line(x, h, x, h - 3, fill='#606060')
+            c.create_line(x, h, x, h - 6, fill='#a0a0a0', width=2)
 
         label_fmt = '%.3f' if self._freq_major_khz < 1 else '%.0f'
         for f in tick_positions(start_khz, stop_khz, self._freq_major_khz):
             x = int((f - start_khz) / span * w)
-            c.create_line(x, h, x, h - 6, fill='#a0a0a0')
+            c.create_line(x, h, x, h - 6, fill='#a0a0a0', width=2)
             c.create_text(x, h - 7, text=label_fmt % f, fill='white', anchor='s', font=('TkFixedFont', 7))
 
         with self._freq_lock:
