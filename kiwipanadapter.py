@@ -48,6 +48,26 @@ MAX_HISTORY_ROWS = 600  # native buffer height (scrollback); displayed height ca
 DEFAULT_WINDOW_HEIGHT = 300
 WF_CAL = -13           # typical Kiwi waterfall calibration offset, dB
 
+# Real headers/URL path captured from an actual Firefox 140 connecting to a
+# KiwiSDR (packet capture, 2026-07-30) -- some Kiwis (confirmed: a genuine
+# KiwiSDR 2, firmware 1.902) allow a browser's own two connections (SND +
+# W/F) from one IP but block a second bare/API-style connection from the
+# same IP. Live-tested: mimicking these gets both connections through
+# reliably (5/6 clean, the one miss was an explicit fast rejection likely
+# from leftover server-side state during rapid back-to-back test runs, not
+# a repeatable "no"). Used only for SDR entries flagged 'mimic_browser' in
+# sdr_list.txt -- see make_stream_options().
+BROWSER_MIMIC_URL_PREFIX = '/ws/kiwi'
+BROWSER_MIMIC_HEADERS = [
+    'User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0',
+    'Accept: */*',
+    'Accept-Language: en-US,en;q=0.5',
+    'Accept-Encoding: gzip, deflate',
+    'DNT: 1',
+    'Pragma: no-cache',
+    'Cache-Control: no-cache',
+]
+
 def parse_bool(val):
     return val.strip().lower() in ('1', 'true', 'yes', 'on')
 
@@ -145,7 +165,7 @@ def build_colormap():
 COLORMAP = build_colormap()
 
 
-def make_stream_options(host, port, options, ws_offset=0):
+def make_stream_options(host, port, options, ws_offset=0, mimic_browser=False):
     """Attribute set KiwiSDRStream/KiwiWorker need, covering both
     LiveWFStream (a plain W/F-only connection, like kiwirecorder's own
     KiwiWaterfallRecorder) and LiveAudioStream (audio playback, ported from
@@ -153,7 +173,10 @@ def make_stream_options(host, port, options, ws_offset=0):
     connections/channels, so each needs its own options with a distinct
     ws_timestamp (ws_offset differentiates them; without it, two
     same-process connections built in the same second would collide on the
-    timestamp baked into the connection URL)."""
+    timestamp baked into the connection URL). mimic_browser (from that SDR's
+    sdr_list.txt entry) makes kiwi/client.py's _prepare_stream send a real
+    browser's headers/URL path instead of this client's normal bare
+    handshake -- see BROWSER_MIMIC_HEADERS above."""
     return SimpleNamespace(
         server_host=host,
         server_port=port,
@@ -206,6 +229,10 @@ def make_stream_options(host, port, options, ws_offset=0):
         is_kiwi_tdoa=False,
         rigctl_enabled=False,
         no_api=False,
+        origin=('http://%s:%s' % (host, port)) if mimic_browser else None,
+        use_permessage_deflate=mimic_browser,
+        extra_headers=BROWSER_MIMIC_HEADERS if mimic_browser else None,
+        url_prefix=BROWSER_MIMIC_URL_PREFIX if mimic_browser else '',
     )
 
 
@@ -270,10 +297,16 @@ def save_config_value(path, key, value):
 
 
 def load_sdr_list(path):
-    """Flat text file: 'name host port' per line, '#' comments, blank lines ignored."""
+    """Flat text file: 'name host port [mimic_browser]' per line, '#' comments,
+    blank lines ignored. The optional trailing 'mimic_browser' flag is for
+    Kiwis that block a second plain connection from the same IP (e.g. some
+    single-IP-restricted KiwiSDRs) but do allow a browser's own two
+    connections -- when set, both the waterfall and audio connections to
+    that SDR present themselves with a real browser's headers/URL path
+    instead of this client's normal bare handshake."""
     if not os.path.exists(path):
         with open(path, 'w') as f:
-            f.write("# name              host                     port\n")
+            f.write("# name              host                     port    [mimic_browser]\n")
             f.write("example             kiwisdr.example.com      8073\n")
     sdrs = []
     with open(path) as f:
@@ -284,21 +317,28 @@ def load_sdr_list(path):
             parts = line.split()
             if len(parts) < 2:
                 continue
+            mimic_browser = False
+            if not parts[-1].lstrip('-').isdigit():
+                mimic_browser = parts[-1] == 'mimic_browser'
+                parts = parts[:-1]
+            if len(parts) < 2:
+                continue
             host = parts[-2]
             port = int(parts[-1])
             name = ' '.join(parts[:-2]) if len(parts) > 2 else host
-            sdrs.append({'name': name, 'host': host, 'port': port})
+            sdrs.append({'name': name, 'host': host, 'port': port, 'mimic_browser': mimic_browser})
     return sdrs
 
 
 def save_sdr_list(path, sdrs):
-    """Rewrite the flat 'name host port' file from an in-memory list."""
+    """Rewrite the flat 'name host port [mimic_browser]' file from an in-memory list."""
     name_w = max((len(s['name']) for s in sdrs), default=4) + 2
     host_w = max((len(s['host']) for s in sdrs), default=4) + 2
     with open(path, 'w') as f:
-        f.write("# name              host                     port\n")
+        f.write("# name              host                     port    [mimic_browser]\n")
         for s in sdrs:
-            f.write("%-*s %-*s %s\n" % (name_w, s['name'], host_w, s['host'], s['port']))
+            suffix = '  mimic_browser' if s.get('mimic_browser') else ''
+            f.write("%-*s %-*s %s%s\n" % (name_w, s['name'], host_w, s['host'], s['port'], suffix))
 
 
 class RigctlPoller(threading.Thread):
@@ -822,6 +862,7 @@ class SdrEntryDialog(tk.Toplevel):
         self._name_var = tk.StringVar(value=entry['name'] if entry else '')
         self._host_var = tk.StringVar(value=entry['host'] if entry else '')
         self._port_var = tk.StringVar(value=str(entry['port']) if entry else '')
+        self._mimic_var = tk.BooleanVar(value=bool(entry.get('mimic_browser')) if entry else False)
 
         form = ttk.Frame(self)
         form.pack(padx=8, pady=8)
@@ -829,6 +870,8 @@ class SdrEntryDialog(tk.Toplevel):
         for row, (label, var) in enumerate(fields):
             ttk.Label(form, text=label).grid(row=row, column=0, sticky='e', pady=2)
             ttk.Entry(form, textvariable=var, width=28).grid(row=row, column=1, pady=2)
+        ttk.Checkbutton(form, text='Mimic browser (for single-IP-restricted Kiwis)',
+                         variable=self._mimic_var).grid(row=len(fields), column=0, columnspan=2, sticky='w', pady=(4, 0))
 
         btns = ttk.Frame(self)
         btns.pack(pady=(0, 8))
@@ -847,7 +890,7 @@ class SdrEntryDialog(tk.Toplevel):
             return
         if not name or not host:
             return
-        self.result = {'name': name, 'host': host, 'port': port}
+        self.result = {'name': name, 'host': host, 'port': port, 'mimic_browser': self._mimic_var.get()}
         self.destroy()
 
 
@@ -878,7 +921,8 @@ class SdrListDialog(tk.Toplevel):
     def _refresh_listbox(self):
         self._listbox.delete(0, 'end')
         for s in self._sdr_list:
-            self._listbox.insert('end', '%s  (%s:%s)' % (s['name'], s['host'], s['port']))
+            mimic = '  [mimic browser]' if s.get('mimic_browser') else ''
+            self._listbox.insert('end', '%s  (%s:%s)%s' % (s['name'], s['host'], s['port'], mimic))
 
     def _save(self):
         save_sdr_list(self._list_path, self._sdr_list)
@@ -1046,26 +1090,46 @@ class PanadapterApp:
     def _start_stream(self, sdr_entry):
         with self._freq_lock:
             freq = self._current_freq_khz if self._current_freq_khz is not None else self._options.default_freq
+        mimic_browser = sdr_entry.get('mimic_browser', False)
 
-        wf_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options, ws_offset=0)
-        self._wf_stream = LiveWFStream(wf_opt, freq, self._options.span, self._row_queue)
-        self._run_event = threading.Event()
-        self._run_event.set()
-        wf_camp_wait_event = threading.Event()
-        wf_camp_wait_event.set()
-        self._worker = KiwiWorker(args=(self._wf_stream, wf_opt, True, False, self._run_event, wf_camp_wait_event))
-        self._worker.start()
+        def start_wf():
+            wf_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options,
+                                          ws_offset=0, mimic_browser=mimic_browser)
+            self._wf_stream = LiveWFStream(wf_opt, freq, self._options.span, self._row_queue)
+            self._run_event = threading.Event()
+            self._run_event.set()
+            wf_camp_wait_event = threading.Event()
+            wf_camp_wait_event.set()
+            self._worker = KiwiWorker(args=(self._wf_stream, wf_opt, True, False, self._run_event, wf_camp_wait_event))
+            self._worker.start()
 
-        audio_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options, ws_offset=1)
-        self._audio_stream = LiveAudioStream(audio_opt, freq, self._options.modulation,
-                                              self._options.lp_cut, self._options.hp_cut)
-        self._audio_run_event = threading.Event()
-        self._audio_run_event.set()
-        audio_camp_wait_event = threading.Event()
-        audio_camp_wait_event.set()
-        self._audio_worker = KiwiWorker(args=(self._audio_stream, audio_opt, True, False,
-                                               self._audio_run_event, audio_camp_wait_event))
-        self._audio_worker.start()
+        def start_audio():
+            audio_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options,
+                                             ws_offset=1, mimic_browser=mimic_browser)
+            self._audio_stream = LiveAudioStream(audio_opt, freq, self._options.modulation,
+                                                  self._options.lp_cut, self._options.hp_cut)
+            self._audio_run_event = threading.Event()
+            self._audio_run_event.set()
+            audio_camp_wait_event = threading.Event()
+            audio_camp_wait_event.set()
+            self._audio_worker = KiwiWorker(args=(self._audio_stream, audio_opt, True, False,
+                                                   self._audio_run_event, audio_camp_wait_event))
+            self._audio_worker.start()
+
+        if mimic_browser:
+            # A real browser always opens its SND connection before its W/F
+            # one (confirmed via packet capture, 2026-07-30: SND SYN then
+            # W/F SYN ~249ms later) -- live-tested as working reliably in
+            # that order; opening W/F first (this app's normal order below)
+            # was observed to get audio's SND connection rejected on a
+            # single-IP-restricted Kiwi even with full header mimicry, so
+            # match the tested order here rather than the normal one.
+            start_audio()
+            time.sleep(0.25)
+            start_wf()
+        else:
+            start_wf()
+            start_audio()
 
         self._status_var.set('connecting to %s...' % sdr_entry['name'])
 

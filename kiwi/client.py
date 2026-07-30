@@ -158,12 +158,22 @@ class KiwiSDRStreamBase(object):
 
     def _prepare_stream(self, host, port, which):
         self._stream_name = which
-        uri = '%s/%d/%s%s' % ('/wb' if self._options.wideband else '', self._options.ws_timestamp, which, '?camp' if self._camp_chan != -1 else '')
-        
+        url_prefix = getattr(self._options, 'url_prefix', '')
+        uri = '%s%s/%d/%s%s' % (url_prefix, '/wb' if self._options.wideband else '', self._options.ws_timestamp, which, '?camp' if self._camp_chan != -1 else '')
+
+        # Optional browser-mimicking overrides (all unset/None by default via
+        # getattr, so existing options objects are unaffected) -- for
+        # experiments only, not needed for normal operation.
+        origin = getattr(self._options, 'origin', None)
+        use_permessage_deflate = getattr(self._options, 'use_permessage_deflate', False)
+        extra_headers = getattr(self._options, 'extra_headers', None)
+
         while True:
             logging.info('URL: %s:%s%s' % (host, port, uri))
             self._socket = socket.create_connection(address=(host, port), timeout=self._options.socket_timeout)
-            handshake = ClientHandshakeProcessor(self._socket, host, port)
+            handshake = ClientHandshakeProcessor(self._socket, host, port, origin=origin,
+                                                  use_permessage_deflate=use_permessage_deflate,
+                                                  extra_headers=extra_headers)
             location, status_code = handshake.handshake(uri)
             if status_code == '101':
                 break

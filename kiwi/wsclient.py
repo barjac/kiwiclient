@@ -244,7 +244,8 @@ class ClientHandshakeProcessor(ClientHandshakeBase):
     draft-ietf-hybi-thewebsocketprotocol-06 and later.
     """
 
-    def __init__(self, socket, host, port, origin=None, deflate_frame=False, use_permessage_deflate=False):
+    def __init__(self, socket, host, port, origin=None, deflate_frame=False, use_permessage_deflate=False,
+                 extra_headers=None):
         super(ClientHandshakeProcessor, self).__init__()
 
         self._socket = socket
@@ -253,6 +254,11 @@ class ClientHandshakeProcessor(ClientHandshakeBase):
         self._origin = origin
         self._deflate_frame = deflate_frame
         self._use_permessage_deflate = use_permessage_deflate
+        # Optional list of raw 'Name: value' strings appended to the request
+        # -- e.g. to replicate a real browser's handshake headers
+        # (User-Agent, Accept*, DNT, Pragma, Cache-Control) for experiments,
+        # not needed for normal operation.
+        self._extra_headers = extra_headers or []
 
         self._logger = util.get_class_logger(self)
 
@@ -291,6 +297,9 @@ class ClientHandshakeProcessor(ClientHandshakeBase):
 
         if len(extensions_to_request) != 0:
             fields.append('%s: %s\r\n' % (common.SEC_WEBSOCKET_EXTENSIONS_HEADER, common.format_extensions(extensions_to_request)))
+
+        for header in self._extra_headers:
+            fields.append('%s\r\n' % header)
 
         self._socket.sendall(request_line)
         for field in fields:
@@ -389,10 +398,17 @@ class ClientHandshakeProcessor(ClientHandshakeBase):
 
             raise ClientHandshakeError('Unexpected extension %r' % extension_name)
 
+        # A server is free to decline an offered extension per the WebSocket
+        # spec -- that's not a handshake failure, just proceed uncompressed
+        # (matches what a real browser does; this client used to treat a
+        # decline as fatal, which broke against Kiwis that don't support
+        # these extensions at all).
         if (self._deflate_frame and not deflate_frame_accepted):
-            raise ClientHandshakeError('Requested %s, but the server rejected it' % common.DEFLATE_FRAME_EXTENSION)
+            self._logger.debug('Requested %s, but the server declined it -- continuing uncompressed', common.DEFLATE_FRAME_EXTENSION)
+            self._deflate_frame = False
         if (self._use_permessage_deflate and not permessage_deflate_accepted):
-            raise ClientHandshakeError('Requested %s, but the server rejected it' % common.PERMESSAGE_DEFLATE_EXTENSION)
+            self._logger.debug('Requested %s, but the server declined it -- continuing uncompressed', common.PERMESSAGE_DEFLATE_EXTENSION)
+            self._use_permessage_deflate = False
         
         return None, status_code
 
