@@ -47,6 +47,8 @@ MAX_FREQ_KHZ = 30000.0  # Kiwi's full tunable range; zoom 0 spans this whole wid
 MAX_HISTORY_ROWS = 600  # native buffer height (scrollback); displayed height can be less or more
 DEFAULT_WINDOW_HEIGHT = 300
 WF_CAL = -13           # typical Kiwi waterfall calibration offset, dB
+MAX_RECONNECT_RETRIES = 5     # per-side auto-retry cap when a connection dies unexpectedly (see _poll_reconnect)
+RECONNECT_RETRY_DELAY_SEC = 2.0
 
 # Real headers/URL path captured from an actual Firefox 140 connecting to a
 # KiwiSDR (packet capture, 2026-07-30) -- some Kiwis (confirmed: a genuine
@@ -544,6 +546,14 @@ class LiveAudioStream(KiwiSDRStream):
         self._playback_rate_adjustment = 1.0
         self._last_rate_check_time = None
 
+        # close() can be called from two different threads for the same
+        # instance -- the GUI thread directly (PanadapterApp._stop_stream)
+        # and this stream's own KiwiWorker reader thread as part of its own
+        # cleanup once it notices the run_event was cleared -- guard so the
+        # actual player teardown only ever runs once.
+        self._close_lock = threading.Lock()
+        self._closed = False
+
     # -- retuning: replaces the old separate-process rigctld-mirror RPC.
     # Both pending values are drained and applied together in
     # _process_audio_samples (the connection's single reader thread),
@@ -680,37 +690,58 @@ class LiveAudioStream(KiwiSDRStream):
                 logging.error("Playback error: %s" % e)
 
     def _init_player(self):
-        if hasattr(self, '_player'):
-            self._player.__exit__(exc_type=None, exc_value=None, traceback=None)
-        options = self._options
-        speaker = sc.get_speaker(options.sounddevice)
-        rate = self._output_sample_rate
-        if speaker is None:
-            if not options.sounddevice:
-                logging.warning('Using default sound device. Specify --snddev?')
-            else:
-                logging.warning('Could not find sound device "%s", using default', options.sounddevice)
-            speaker = sc.default_speaker()
+        # Shares close()'s lock -- this can run on this stream's own reader
+        # thread (a genuine sample-rate change) at the same time close() is
+        # invoked from the GUI thread (SDR switch) or from this stream's own
+        # KiwiWorker cleanup once the run_event is cleared; both touch
+        # _player/_playback_thread and PulseAudio/PipeWire's client library
+        # isn't safe for concurrent use of those, so serialize through the
+        # same lock rather than just this method's own internal ordering.
+        with self._close_lock:
+            if self._closed:
+                return   # stream is being torn down, no point starting new audio
 
-        # pulseaudio has sporadic failures, retry a few times
-        for i in range(0, 10):
-            try:
-                # Small blocksize to avoid long blocking in play() which delays retunes
-                self._player = speaker.player(samplerate=rate, blocksize=self._options.blocksize)
-                self._player.__enter__()
-                break
-            except Exception as ex:
-                logging.warning('speaker.player failed with %s', ex)
-                time.sleep(0.1)
+            # Stop the old playback thread and confirm it's genuinely finished
+            # (real join, no timeout) *before* touching the old player -- the
+            # thread may be mid player.play() right now, and exiting the player
+            # out from under an in-flight play() call crashes the whole process
+            # at the native soundcard/PipeWire level, not a catchable Python
+            # exception. Only safe to skip when there's no previous thread yet
+            # (first call).
+            if self._playback_running:
+                self._playback_running = False
+                if self._playback_thread:
+                    self._playback_thread.join()
+            if hasattr(self, '_player'):
+                try:
+                    self._player.__exit__(exc_type=None, exc_value=None, traceback=None)
+                except Exception as e:
+                    logging.debug('failed to close previous audio player: %s', e)
 
-        if self._playback_running:
-            self._playback_running = False
-            if self._playback_thread:
-                self._playback_thread.join(timeout=1.0)
+            options = self._options
+            speaker = sc.get_speaker(options.sounddevice)
+            rate = self._output_sample_rate
+            if speaker is None:
+                if not options.sounddevice:
+                    logging.warning('Using default sound device. Specify --snddev?')
+                else:
+                    logging.warning('Could not find sound device "%s", using default', options.sounddevice)
+                speaker = sc.default_speaker()
 
-        self._playback_running = True
-        self._playback_thread = threading.Thread(target=self._playback_thread_func, daemon=True)
-        self._playback_thread.start()
+            # pulseaudio has sporadic failures, retry a few times
+            for i in range(0, 10):
+                try:
+                    # Small blocksize to avoid long blocking in play() which delays retunes
+                    self._player = speaker.player(samplerate=rate, blocksize=self._options.blocksize)
+                    self._player.__enter__()
+                    break
+                except Exception as ex:
+                    logging.warning('speaker.player failed with %s', ex)
+                    time.sleep(0.1)
+
+            self._playback_running = True
+            self._playback_thread = threading.Thread(target=self._playback_thread_func, daemon=True)
+            self._playback_thread.start()
 
     def _setup_rx_params(self):
         self.set_name(self._options.user)
@@ -847,6 +878,39 @@ class LiveAudioStream(KiwiSDRStream):
                 return
             self._output_sample_rate = int(self._sample_rate)
             self._init_player()
+
+    def close(self):
+        # _init_player() only closes the *previous* player when called again
+        # on the same instance (a real sample-rate change) -- when this whole
+        # stream object is being discarded instead (SDR switch, app close),
+        # nothing else ever stops the playback thread or exits the sound
+        # device player, leaking one zombie PipeWire stream per switch with
+        # nothing to ever stop it since it's a daemon thread.
+        #
+        # Deliberately synchronous (blocks the caller -- the GUI thread on an
+        # SDR switch -- for however long the playback thread takes to notice
+        # and finish, normally well under a second): a background-thread
+        # version was tried first to avoid that brief GUI pause, but it let
+        # this old player's teardown run concurrently with the *new*
+        # LiveAudioStream's _init_player() setting up its own player during
+        # a switch -- PulseAudio/PipeWire's client library isn't safe for
+        # that and aborted the whole process with a native assertion
+        # failure (not a catchable Python exception). Blocking here until
+        # the old player is genuinely gone, before PanadapterApp._start_stream()
+        # can create the new one, is what actually avoids the race -- a
+        # short pause beats a process crash.
+        with self._close_lock:
+            if not self._closed:
+                self._closed = True
+                self._playback_running = False
+                if self._playback_thread:
+                    self._playback_thread.join()
+                if hasattr(self, '_player'):
+                    try:
+                        self._player.__exit__(exc_type=None, exc_value=None, traceback=None)
+                    except Exception as e:
+                        logging.debug('failed to close audio player: %s', e)
+        super().close()
 
 
 class SdrEntryDialog(tk.Toplevel):
@@ -1017,6 +1081,8 @@ class PanadapterApp:
         self._last_start = None
         self._last_stop = None
         self._active_sdr = None
+        self._reconnect_retry_count = 0
+        self._reconnect_after_id = None
 
         root.title('Kiwi Panadapter')
         self._build_ui()
@@ -1030,6 +1096,7 @@ class PanadapterApp:
         self._active_sdr = self._initial_sdr
         root.protocol('WM_DELETE_WINDOW', self._on_close)
         self._poll_queue()
+        self._poll_reconnect()
 
     def _build_ui(self):
         screen_w = self._root.winfo_screenwidth()
@@ -1087,34 +1154,34 @@ class PanadapterApp:
 
     # -- SDR connection management -------------------------------------------------
 
+    def _start_wf_connection(self, sdr_entry, freq, mimic_browser):
+        wf_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options,
+                                      ws_offset=0, mimic_browser=mimic_browser)
+        self._wf_stream = LiveWFStream(wf_opt, freq, self._options.span, self._row_queue)
+        self._run_event = threading.Event()
+        self._run_event.set()
+        wf_camp_wait_event = threading.Event()
+        wf_camp_wait_event.set()
+        self._worker = KiwiWorker(args=(self._wf_stream, wf_opt, True, False, self._run_event, wf_camp_wait_event))
+        self._worker.start()
+
+    def _start_audio_connection(self, sdr_entry, freq, mimic_browser):
+        audio_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options,
+                                         ws_offset=1, mimic_browser=mimic_browser)
+        self._audio_stream = LiveAudioStream(audio_opt, freq, self._options.modulation,
+                                              self._options.lp_cut, self._options.hp_cut)
+        self._audio_run_event = threading.Event()
+        self._audio_run_event.set()
+        audio_camp_wait_event = threading.Event()
+        audio_camp_wait_event.set()
+        self._audio_worker = KiwiWorker(args=(self._audio_stream, audio_opt, True, False,
+                                               self._audio_run_event, audio_camp_wait_event))
+        self._audio_worker.start()
+
     def _start_stream(self, sdr_entry):
         with self._freq_lock:
             freq = self._current_freq_khz if self._current_freq_khz is not None else self._options.default_freq
         mimic_browser = sdr_entry.get('mimic_browser', False)
-
-        def start_wf():
-            wf_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options,
-                                          ws_offset=0, mimic_browser=mimic_browser)
-            self._wf_stream = LiveWFStream(wf_opt, freq, self._options.span, self._row_queue)
-            self._run_event = threading.Event()
-            self._run_event.set()
-            wf_camp_wait_event = threading.Event()
-            wf_camp_wait_event.set()
-            self._worker = KiwiWorker(args=(self._wf_stream, wf_opt, True, False, self._run_event, wf_camp_wait_event))
-            self._worker.start()
-
-        def start_audio():
-            audio_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options,
-                                             ws_offset=1, mimic_browser=mimic_browser)
-            self._audio_stream = LiveAudioStream(audio_opt, freq, self._options.modulation,
-                                                  self._options.lp_cut, self._options.hp_cut)
-            self._audio_run_event = threading.Event()
-            self._audio_run_event.set()
-            audio_camp_wait_event = threading.Event()
-            audio_camp_wait_event.set()
-            self._audio_worker = KiwiWorker(args=(self._audio_stream, audio_opt, True, False,
-                                                   self._audio_run_event, audio_camp_wait_event))
-            self._audio_worker.start()
 
         if mimic_browser:
             # A real browser always opens its SND connection before its W/F
@@ -1124,16 +1191,22 @@ class PanadapterApp:
             # was observed to get audio's SND connection rejected on a
             # single-IP-restricted Kiwi even with full header mimicry, so
             # match the tested order here rather than the normal one.
-            start_audio()
+            self._start_audio_connection(sdr_entry, freq, mimic_browser)
             time.sleep(0.25)
-            start_wf()
+            self._start_wf_connection(sdr_entry, freq, mimic_browser)
         else:
-            start_wf()
-            start_audio()
+            self._start_wf_connection(sdr_entry, freq, mimic_browser)
+            self._start_audio_connection(sdr_entry, freq, mimic_browser)
 
         self._status_var.set('connecting to %s...' % sdr_entry['name'])
 
     def _stop_stream(self):
+        if self._reconnect_after_id is not None:
+            try:
+                self._root.after_cancel(self._reconnect_after_id)
+            except Exception:
+                pass
+            self._reconnect_after_id = None
         if self._worker is not None:
             self._run_event.clear()
             try:
@@ -1153,6 +1226,65 @@ class PanadapterApp:
             self._audio_worker = None
             self._audio_stream = None
 
+    def _poll_reconnect(self):
+        # Some Kiwis' admission of a second (mimic_browser) connection isn't
+        # 100% reliable even with full browser mimicry -- live-tested at
+        # ~83% in isolation, but retrying just the one side that died against
+        # an already-open, aging companion connection was observed live to
+        # fail every single time (6/6) -- consistent with the Kiwi expecting
+        # the companion to arrive within a short window of the first
+        # connection, the same way a real browser's own pair always does.
+        # So a detected failure on either side tears down *both* and
+        # restarts the whole pair together, close in time again, rather than
+        # patching just the side that died.
+        if self._active_sdr is not None and self._reconnect_after_id is None:
+            wf_down = (self._worker is not None and self._run_event is not None
+                       and not self._run_event.is_set())
+            audio_down = (self._audio_worker is not None and self._audio_run_event is not None
+                          and not self._audio_run_event.is_set())
+            if wf_down or audio_down:
+                self._schedule_reconnect()
+        self._root.after(1000, self._poll_reconnect)
+
+    def _schedule_reconnect(self):
+        if self._reconnect_retry_count >= MAX_RECONNECT_RETRIES:
+            logging.warning('connection to %s failed %d times in a row, giving up automatic retry -- '
+                             'reselect the SDR to try again', self._active_sdr['name'], self._reconnect_retry_count)
+            return
+        self._reconnect_retry_count += 1
+        logging.info('connection to %s dropped, retrying both sides together (%d/%d)...',
+                     self._active_sdr['name'], self._reconnect_retry_count, MAX_RECONNECT_RETRIES)
+
+        def do_reconnect():
+            self._reconnect_after_id = None
+            if self._active_sdr is None:
+                return   # SDR was switched away while we were waiting
+            sdr_entry = self._active_sdr
+            # Tear down whichever side is still up too -- restarting only the
+            # dead side while leaving a now-aging companion connection in
+            # place is exactly the pattern that was observed to never work.
+            if self._worker is not None:
+                self._run_event.clear()
+                try:
+                    self._wf_stream.close()
+                except Exception:
+                    pass
+                self._worker.join(timeout=2)
+                self._worker = None
+                self._wf_stream = None
+            if self._audio_worker is not None:
+                self._audio_run_event.clear()
+                try:
+                    self._audio_stream.close()
+                except Exception:
+                    pass
+                self._audio_worker.join(timeout=2)
+                self._audio_worker = None
+                self._audio_stream = None
+            self._start_stream(sdr_entry)
+
+        self._reconnect_after_id = self._root.after(int(RECONNECT_RETRY_DELAY_SEC * 1000), do_reconnect)
+
     def _on_sdr_change(self, _event):
         name = self._sdr_var.get()
         entry = next((s for s in self._sdr_list if s['name'] == name), None)
@@ -1171,6 +1303,7 @@ class PanadapterApp:
         self._smeter_peak_set_ts = None
         self._smeter_peak_last_ts = None
         self._wf_auto_floor_dbm = None
+        self._reconnect_retry_count = 0
         self._start_stream(entry)
         self._active_sdr = entry
         try:
