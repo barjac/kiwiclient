@@ -49,6 +49,10 @@ DEFAULT_WINDOW_HEIGHT = 300
 WF_CAL = -13           # typical Kiwi waterfall calibration offset, dB
 MAX_RECONNECT_RETRIES = 5     # per-side auto-retry cap when a connection dies unexpectedly (see _poll_reconnect)
 RECONNECT_RETRY_DELAY_SEC = 2.0
+RECONNECT_HEALTHY_RESET_SEC = 3.0  # a stream up this long counts as recovered -- resets the retry counter
+                                    # (some Kiwis/proxies cleanly kick a mimic_browser connection every ~10s
+                                    # regardless; without this, that alone exhausts MAX_RECONNECT_RETRIES and
+                                    # the app gives up for good even though every individual reconnect works)
 
 # Real headers/URL path captured from an actual Firefox 140 connecting to a
 # KiwiSDR (packet capture, 2026-07-30) -- some Kiwis (confirmed: a genuine
@@ -167,18 +171,22 @@ def build_colormap():
 COLORMAP = build_colormap()
 
 
-def make_stream_options(host, port, options, ws_offset=0, mimic_browser=False):
+def make_stream_options(host, port, options, ws_offset=0, mimic_browser=False, ws_timestamp=None):
     """Attribute set KiwiSDRStream/KiwiWorker need, covering both
     LiveWFStream (a plain W/F-only connection, like kiwirecorder's own
     KiwiWaterfallRecorder) and LiveAudioStream (audio playback, ported from
     kiwiclientd's KiwiSoundRecorder) -- these are two independent
-    connections/channels, so each needs its own options with a distinct
-    ws_timestamp (ws_offset differentiates them; without it, two
-    same-process connections built in the same second would collide on the
-    timestamp baked into the connection URL). mimic_browser (from that SDR's
-    sdr_list.txt entry) makes kiwi/client.py's _prepare_stream send a real
-    browser's headers/URL path instead of this client's normal bare
-    handshake -- see BROWSER_MIMIC_HEADERS above."""
+    connections/channels, so by default each gets its own ws_timestamp
+    (ws_offset differentiates them -- the SND/W/F suffix in the URL already
+    keeps the two apart, so this is just extra insurance). Pass an explicit
+    ws_timestamp to force both connections to share one value instead --
+    needed for mimic_browser, since a real browser tab opens its SND and W/F
+    sockets off the *same* page-load timestamp, and a single-IP-restricted
+    Kiwi's admission check for the second connection appears to key off that
+    match (see _start_stream). mimic_browser (from that SDR's sdr_list.txt
+    entry) makes kiwi/client.py's _prepare_stream send a real browser's
+    headers/URL path instead of this client's normal bare handshake -- see
+    BROWSER_MIMIC_HEADERS above."""
     return SimpleNamespace(
         server_host=host,
         server_port=port,
@@ -203,7 +211,8 @@ def make_stream_options(host, port, options, ws_offset=0, mimic_browser=False):
         lp_cut=options.lp_cut,
         hp_cut=options.hp_cut,
         wideband=False,
-        ws_timestamp=int(time.time() + os.getpid() + ws_offset) & 0xffffffff,
+        ws_timestamp=(ws_timestamp if ws_timestamp is not None
+                      else int(time.time() + os.getpid() + ws_offset) & 0xffffffff),
         bad_cmd=False,
         sound=True,
         resample=options.resample,
@@ -1133,6 +1142,7 @@ class PanadapterApp:
         self._active_sdr = None
         self._reconnect_retry_count = 0
         self._reconnect_after_id = None
+        self._stream_start_ts = None
 
         root.title('Kiwi Panadapter')
         self._build_ui()
@@ -1204,9 +1214,9 @@ class PanadapterApp:
 
     # -- SDR connection management -------------------------------------------------
 
-    def _start_wf_connection(self, sdr_entry, freq, mimic_browser):
+    def _start_wf_connection(self, sdr_entry, freq, mimic_browser, ws_timestamp=None):
         wf_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options,
-                                      ws_offset=0, mimic_browser=mimic_browser)
+                                      ws_offset=0, mimic_browser=mimic_browser, ws_timestamp=ws_timestamp)
         self._wf_stream = LiveWFStream(wf_opt, freq, self._options.span, self._row_queue)
         self._run_event = threading.Event()
         self._run_event.set()
@@ -1215,9 +1225,9 @@ class PanadapterApp:
         self._worker = KiwiWorker(args=(self._wf_stream, wf_opt, True, False, self._run_event, wf_camp_wait_event))
         self._worker.start()
 
-    def _start_audio_connection(self, sdr_entry, freq, mimic_browser):
+    def _start_audio_connection(self, sdr_entry, freq, mimic_browser, ws_timestamp=None):
         audio_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options,
-                                         ws_offset=1, mimic_browser=mimic_browser)
+                                         ws_offset=1, mimic_browser=mimic_browser, ws_timestamp=ws_timestamp)
         self._audio_stream = LiveAudioStream(audio_opt, freq, self._options.modulation,
                                               self._options.lp_cut, self._options.hp_cut)
         self._audio_run_event = threading.Event()
@@ -1241,14 +1251,22 @@ class PanadapterApp:
             # was observed to get audio's SND connection rejected on a
             # single-IP-restricted Kiwi even with full header mimicry, so
             # match the tested order here rather than the normal one.
-            self._start_audio_connection(sdr_entry, freq, mimic_browser)
+            #
+            # A real browser's SND and W/F sockets both carry the *same*
+            # page-load ws_timestamp -- share one here too (instead of the
+            # default per-connection ws_offset split) so the pair looks like
+            # one browser tab rather than two unrelated sessions from the
+            # same IP, which single-IP admission logic seems to key off.
+            shared_ts = int(time.time() + os.getpid()) & 0xffffffff
+            self._start_audio_connection(sdr_entry, freq, mimic_browser, ws_timestamp=shared_ts)
             time.sleep(0.25)
-            self._start_wf_connection(sdr_entry, freq, mimic_browser)
+            self._start_wf_connection(sdr_entry, freq, mimic_browser, ws_timestamp=shared_ts)
         else:
             self._start_wf_connection(sdr_entry, freq, mimic_browser)
             self._start_audio_connection(sdr_entry, freq, mimic_browser)
 
         self._status_var.set('connecting to %s...' % sdr_entry['name'])
+        self._stream_start_ts = time.time()
 
     def _stop_stream(self):
         if self._reconnect_after_id is not None:
@@ -1294,6 +1312,11 @@ class PanadapterApp:
                           and not self._audio_run_event.is_set())
             if wf_down or audio_down:
                 self._schedule_reconnect()
+            elif (self._reconnect_retry_count > 0 and self._stream_start_ts is not None
+                  and time.time() - self._stream_start_ts >= RECONNECT_HEALTHY_RESET_SEC):
+                logging.info('connection to %s has been up %.0fs, resetting retry counter',
+                             self._active_sdr['name'], time.time() - self._stream_start_ts)
+                self._reconnect_retry_count = 0
         self._root.after(1000, self._poll_reconnect)
 
     def _schedule_reconnect(self):
