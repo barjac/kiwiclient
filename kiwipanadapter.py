@@ -64,6 +64,12 @@ RECONNECT_HEALTHY_RESET_SEC = 3.0  # a stream up this long counts as recovered -
 # a repeatable "no"). Used only for SDR entries flagged 'mimic_browser' in
 # sdr_list.txt -- see make_stream_options().
 BROWSER_MIMIC_URL_PREFIX = '/ws/kiwi'
+# Real client self-identification string captured from the same Firefox
+# session -- sent once per connection right after 'SET auth', as
+# 'SERVER DE CLIENT <name> <SND|W/F>'. This is the exact string Weston's own
+# page already causes a real browser visit to send; some Kiwis may cap
+# session length for connections that never identify themselves this way.
+BROWSER_MIMIC_CLIENT_IDENT = 'openwebrx.js'
 BROWSER_MIMIC_HEADERS = [
     'User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0',
     'Accept: */*',
@@ -244,6 +250,7 @@ def make_stream_options(host, port, options, ws_offset=0, mimic_browser=False, w
         use_permessage_deflate=mimic_browser,
         extra_headers=BROWSER_MIMIC_HEADERS if mimic_browser else None,
         url_prefix=BROWSER_MIMIC_URL_PREFIX if mimic_browser else '',
+        client_ident=BROWSER_MIMIC_CLIENT_IDENT if mimic_browser else None,
     )
 
 

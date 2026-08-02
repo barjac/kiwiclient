@@ -571,9 +571,9 @@ class KiwiSDRStream(KiwiSDRStreamBase):
                 self._last_snd_keepalive = secs
         elif tag == 'W/F':
             self._process_wf(body[1:]) ## skip 1st byte
-            
+
             # Ensure we don't get kicked due to timeouts (only send at 1 Hz)
-            secs = time.time()
+            secs = int(time.time())
             if secs != self._last_wf_keepalive:
                 self._set_keepalive()
                 self._last_wf_keepalive = secs
@@ -898,6 +898,9 @@ class KiwiSDRStream(KiwiSDRStreamBase):
             if self._options.nolocal:
                 self._send_message('SET options=1')
             self._set_auth('admin' if self._options.admin else 'kiwi', self._options.password, self._options.tlimit_password)
+            client_ident = getattr(self._options, 'client_ident', None)
+            if client_ident:
+                self._send_message('SERVER DE CLIENT %s %s' % (client_ident, self._stream_name))
 
     def close(self):
         if self._stream == None:
