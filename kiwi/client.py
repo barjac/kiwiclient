@@ -167,13 +167,15 @@ class KiwiSDRStreamBase(object):
         origin = getattr(self._options, 'origin', None)
         use_permessage_deflate = getattr(self._options, 'use_permessage_deflate', False)
         extra_headers = getattr(self._options, 'extra_headers', None)
+        header_order = getattr(self._options, 'header_order', None)
 
         while True:
             logging.info('URL: %s:%s%s' % (host, port, uri))
             self._socket = socket.create_connection(address=(host, port), timeout=self._options.socket_timeout)
             handshake = ClientHandshakeProcessor(self._socket, host, port, origin=origin,
                                                   use_permessage_deflate=use_permessage_deflate,
-                                                  extra_headers=extra_headers)
+                                                  extra_headers=extra_headers,
+                                                  header_order=header_order)
             location, status_code = handshake.handshake(uri)
             if status_code == '101':
                 break
@@ -482,7 +484,8 @@ class KiwiSDRStream(KiwiSDRStreamBase):
 
         # Handle error conditions
         if name == 'too_busy':
-            raise KiwiTooBusyError('%s: all %s client slots taken' % (self._options.server_host, value))
+            if value != '0':
+                raise KiwiTooBusyError('%s: all %s client slots taken' % (self._options.server_host, value))
         if name == 'redirect':
             raise KiwiRedirectError(urllib.unquote(value))
         if name == 'badp':

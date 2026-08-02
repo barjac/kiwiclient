@@ -245,7 +245,7 @@ class ClientHandshakeProcessor(ClientHandshakeBase):
     """
 
     def __init__(self, socket, host, port, origin=None, deflate_frame=False, use_permessage_deflate=False,
-                 extra_headers=None):
+                 extra_headers=None, header_order=None):
         super(ClientHandshakeProcessor, self).__init__()
 
         self._socket = socket
@@ -259,6 +259,12 @@ class ClientHandshakeProcessor(ClientHandshakeBase):
         # (User-Agent, Accept*, DNT, Pragma, Cache-Control) for experiments,
         # not needed for normal operation.
         self._extra_headers = extra_headers or []
+        # Optional list of header names giving the exact emission order --
+        # e.g. to replicate a real browser's handshake byte-for-byte (some
+        # servers/proxies fingerprint clients by header order, not just
+        # content). None keeps the original fixed-protocol-headers-then-
+        # extras order, unaffected for every caller that doesn't set this.
+        self._header_order = header_order
 
         self._logger = util.get_class_logger(self)
 
@@ -272,18 +278,23 @@ class ClientHandshakeProcessor(ClientHandshakeBase):
         request_line = _build_method_line(resource)
         self._logger.debug('Client\'s opening handshake Request-Line: %r', request_line)
 
-        fields = []
-        fields.append(_format_host_header(self._host, self._port, False))
-        fields.append(_UPGRADE_HEADER)
-        fields.append(_CONNECTION_HEADER)
+        # Build each header's formatted line keyed by name, so a caller can
+        # request a specific emission order (self._header_order) instead of
+        # the default fixed-protocol-headers-then-extras sequence below --
+        # some servers/proxies fingerprint clients by header order, and a
+        # real browser interleaves these rather than grouping them.
+        header_lines = {}
+        header_lines['Host'] = _format_host_header(self._host, self._port, False)
+        header_lines['Upgrade'] = _UPGRADE_HEADER
+        header_lines['Connection'] = _CONNECTION_HEADER
         if self._origin is not None:
-            fields.append(_origin_header(common.ORIGIN_HEADER, self._origin))
+            header_lines[common.ORIGIN_HEADER] = _origin_header(common.ORIGIN_HEADER, self._origin)
 
         original_key = os.urandom(16)
         self._key = base64.b64encode(original_key)
         self._logger.debug('%s: %r (%s)', common.SEC_WEBSOCKET_KEY_HEADER, self._key, util.hexify(original_key))
-        fields.append('%s: %s\r\n' % (common.SEC_WEBSOCKET_KEY_HEADER, self._key.decode()))
-        fields.append('%s: %d\r\n' % (common.SEC_WEBSOCKET_VERSION_HEADER, common.VERSION_HYBI_LATEST))
+        header_lines[common.SEC_WEBSOCKET_KEY_HEADER] = '%s: %s\r\n' % (common.SEC_WEBSOCKET_KEY_HEADER, self._key.decode())
+        header_lines[common.SEC_WEBSOCKET_VERSION_HEADER] = '%s: %d\r\n' % (common.SEC_WEBSOCKET_VERSION_HEADER, common.VERSION_HYBI_LATEST)
         extensions_to_request = []
 
         if self._deflate_frame:
@@ -296,10 +307,26 @@ class ClientHandshakeProcessor(ClientHandshakeBase):
             extensions_to_request.append(extension)
 
         if len(extensions_to_request) != 0:
-            fields.append('%s: %s\r\n' % (common.SEC_WEBSOCKET_EXTENSIONS_HEADER, common.format_extensions(extensions_to_request)))
+            header_lines[common.SEC_WEBSOCKET_EXTENSIONS_HEADER] = '%s: %s\r\n' % (common.SEC_WEBSOCKET_EXTENSIONS_HEADER, common.format_extensions(extensions_to_request))
 
         for header in self._extra_headers:
-            fields.append('%s\r\n' % header)
+            header_lines[header.split(':', 1)[0]] = '%s\r\n' % header
+
+        if self._header_order:
+            fields = [header_lines[name] for name in self._header_order if name in header_lines]
+        else:
+            fields = []
+            fields.append(header_lines['Host'])
+            fields.append(header_lines['Upgrade'])
+            fields.append(header_lines['Connection'])
+            if common.ORIGIN_HEADER in header_lines:
+                fields.append(header_lines[common.ORIGIN_HEADER])
+            fields.append(header_lines[common.SEC_WEBSOCKET_KEY_HEADER])
+            fields.append(header_lines[common.SEC_WEBSOCKET_VERSION_HEADER])
+            if common.SEC_WEBSOCKET_EXTENSIONS_HEADER in header_lines:
+                fields.append(header_lines[common.SEC_WEBSOCKET_EXTENSIONS_HEADER])
+            for header in self._extra_headers:
+                fields.append(header_lines[header.split(':', 1)[0]])
 
         self._socket.sendall(request_line)
         for field in fields:

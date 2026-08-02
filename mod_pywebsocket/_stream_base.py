@@ -107,17 +107,29 @@ class StreamBase(object):
         """Reads length bytes from connection. In case we catch any exception,
         prepends remote address to the exception message and raise again.
 
+        TCP is a byte stream, not message-based -- a single recv() call is
+        free to return fewer than `length` bytes at any time (more likely
+        over a real WAN link than on loopback/LAN, where this rarely
+        triggers). Loop until the full length is accumulated, rather than
+        handing the frame parser a short/incomplete chunk, which silently
+        desyncs WS frame boundaries from that point on.
+
         Raises:
             ConnectionTerminatedException: when read returns empty string.
         """
 
         try:
-            read_bytes = self._request.connection.read(length)
-            if not read_bytes:
-                raise ConnectionTerminatedException(
-                    'Receiving %d byte failed. Peer (%r) closed connection' %
-                    (length, (self._request.connection.remote_addr,)))
-            return read_bytes
+            chunks = []
+            remaining = length
+            while remaining > 0:
+                chunk = self._request.connection.read(remaining)
+                if not chunk:
+                    raise ConnectionTerminatedException(
+                        'Receiving %d byte failed. Peer (%r) closed connection' %
+                        (length, (self._request.connection.remote_addr,)))
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return chunks[0] if len(chunks) == 1 else b''.join(chunks)
         except socket.error as e:
             # Catch a socket.error. Because it's not a child class of the
             # IOError prior to Python 2.6, we cannot omit this except clause.

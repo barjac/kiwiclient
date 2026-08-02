@@ -79,6 +79,17 @@ BROWSER_MIMIC_HEADERS = [
     'Pragma: no-cache',
     'Cache-Control: no-cache',
 ]
+# Exact header emission order captured from the same Firefox session -- the
+# values above already matched, but kiwi/wsclient.py's default handshake
+# groups its own WS-protocol headers first and appends extras afterward,
+# which doesn't match how a real browser interleaves them. Some
+# servers/proxies fingerprint clients by header order, not just content.
+BROWSER_MIMIC_HEADER_ORDER = [
+    'Host', 'User-Agent', 'Accept', 'Accept-Language', 'Accept-Encoding',
+    'Sec-WebSocket-Version', 'Origin', 'Sec-WebSocket-Extensions',
+    'Sec-WebSocket-Key', 'DNT', 'Connection', 'Pragma', 'Cache-Control',
+    'Upgrade',
+]
 
 def parse_bool(val):
     return val.strip().lower() in ('1', 'true', 'yes', 'on')
@@ -249,6 +260,7 @@ def make_stream_options(host, port, options, ws_offset=0, mimic_browser=False, w
         origin=('http://%s:%s' % (host, port)) if mimic_browser else None,
         use_permessage_deflate=mimic_browser,
         extra_headers=BROWSER_MIMIC_HEADERS if mimic_browser else None,
+        header_order=BROWSER_MIMIC_HEADER_ORDER if mimic_browser else None,
         url_prefix=BROWSER_MIMIC_URL_PREFIX if mimic_browser else '',
         client_ident=BROWSER_MIMIC_CLIENT_IDENT if mimic_browser else None,
     )
