@@ -327,30 +327,38 @@ def save_config_value(path, key, value):
 
 
 def _parse_sdr_tokens(parts):
-    """parts: whitespace-split tokens of 'name... host port [mimic_browser]'.
-    Returns (name, host, port, mimic_browser) or None if it doesn't parse."""
+    """parts: whitespace-split tokens of 'name... host port [mimic_browser] [no_sound]'
+    (trailing flags in any order). Returns (name, host, port, mimic_browser,
+    no_sound) or None if it doesn't parse."""
     if len(parts) < 2:
         return None
     mimic_browser = False
-    if not parts[-1].lstrip('-').isdigit():
-        mimic_browser = parts[-1] == 'mimic_browser'
+    no_sound = False
+    while parts and not parts[-1].lstrip('-').isdigit():
+        if parts[-1] == 'mimic_browser':
+            mimic_browser = True
+        elif parts[-1] == 'no_sound':
+            no_sound = True
         parts = parts[:-1]
     if len(parts) < 2 or not parts[-1].lstrip('-').isdigit():
         return None
     host = parts[-2]
     port = int(parts[-1])
     name = ' '.join(parts[:-2]) if len(parts) > 2 else host
-    return name, host, port, mimic_browser
+    return name, host, port, mimic_browser, no_sound
 
 
 def load_sdr_list(path):
-    """Flat text file: 'name host port [mimic_browser]' per line, '#' comments,
-    blank lines ignored. The optional trailing 'mimic_browser' flag is for
-    Kiwis that block a second plain connection from the same IP (e.g. some
-    single-IP-restricted KiwiSDRs) but do allow a browser's own two
-    connections -- when set, both the waterfall and audio connections to
+    """Flat text file: 'name host port [mimic_browser] [no_sound]' per line,
+    '#' comments, blank lines ignored. The optional trailing 'mimic_browser'
+    flag is for Kiwis that block a second plain connection from the same IP
+    (e.g. some single-IP-restricted KiwiSDRs) but do allow a browser's own
+    two connections -- when set, both the waterfall and audio connections to
     that SDR present themselves with a real browser's headers/URL path
-    instead of this client's normal bare handshake.
+    instead of this client's normal bare handshake. The optional trailing
+    'no_sound' flag skips the audio connection entirely, opening only the
+    waterfall -- for an SDR whose audio channel isn't usable/wanted (e.g.
+    Weston's still-unexplained ~10s audio-channel disconnect).
 
     A whole line starting with '#' that still parses as a valid entry (once
     the '#' is stripped) is a *disabled* entry -- kept out of the main SDR
@@ -360,7 +368,7 @@ def load_sdr_list(path):
     anything that doesn't parse as an entry) is just a comment, as before."""
     if not os.path.exists(path):
         with open(path, 'w') as f:
-            f.write("# name              host                     port    [mimic_browser]\n")
+            f.write("# name              host                     port    [mimic_browser] [no_sound]\n")
             f.write("example             kiwisdr.example.com      8073\n")
     sdrs = []
     with open(path) as f:
@@ -374,7 +382,7 @@ def load_sdr_list(path):
                 if parsed is None:
                     continue   # an ordinary comment/header line
                 disabled = True
-                name, host, port, mimic_browser = parsed
+                name, host, port, mimic_browser, no_sound = parsed
             else:
                 content = content.split('#', 1)[0].strip()
                 if not content:
@@ -382,22 +390,28 @@ def load_sdr_list(path):
                 parsed = _parse_sdr_tokens(content.split())
                 if parsed is None:
                     continue
-                name, host, port, mimic_browser = parsed
+                name, host, port, mimic_browser, no_sound = parsed
             sdrs.append({'name': name, 'host': host, 'port': port,
-                         'mimic_browser': mimic_browser, 'disabled': disabled})
+                         'mimic_browser': mimic_browser, 'no_sound': no_sound,
+                         'disabled': disabled})
     return sdrs
 
 
 def save_sdr_list(path, sdrs):
-    """Rewrite the flat 'name host port [mimic_browser]' file from an in-memory
-    list. A disabled entry is written back as a '#'-commented line (still a
-    valid entry, just hidden from the selector -- see load_sdr_list)."""
+    """Rewrite the flat 'name host port [mimic_browser] [no_sound]' file from
+    an in-memory list. A disabled entry is written back as a '#'-commented
+    line (still a valid entry, just hidden from the selector -- see
+    load_sdr_list)."""
     name_w = max((len(s['name']) for s in sdrs), default=4) + 2
     host_w = max((len(s['host']) for s in sdrs), default=4) + 2
     with open(path, 'w') as f:
-        f.write("# name              host                     port    [mimic_browser]\n")
+        f.write("# name              host                     port    [mimic_browser] [no_sound]\n")
         for s in sdrs:
-            suffix = '  mimic_browser' if s.get('mimic_browser') else ''
+            suffix = ''
+            if s.get('mimic_browser'):
+                suffix += '  mimic_browser'
+            if s.get('no_sound'):
+                suffix += '  no_sound'
             prefix = '# ' if s.get('disabled') else ''
             f.write("%s%-*s %-*s %s%s\n" % (prefix, name_w, s['name'], host_w, s['host'], s['port'], suffix))
 
@@ -986,6 +1000,7 @@ class SdrEntryDialog(tk.Toplevel):
         self._host_var = tk.StringVar(value=entry['host'] if entry else '')
         self._port_var = tk.StringVar(value=str(entry['port']) if entry else '')
         self._mimic_var = tk.BooleanVar(value=bool(entry.get('mimic_browser')) if entry else False)
+        self._no_sound_var = tk.BooleanVar(value=bool(entry.get('no_sound')) if entry else False)
         self._disabled_var = tk.BooleanVar(value=bool(entry.get('disabled')) if entry else False)
 
         form = ttk.Frame(self)
@@ -996,8 +1011,10 @@ class SdrEntryDialog(tk.Toplevel):
             ttk.Entry(form, textvariable=var, width=28).grid(row=row, column=1, pady=2)
         ttk.Checkbutton(form, text='Mimic browser (for single-IP-restricted Kiwis)',
                          variable=self._mimic_var).grid(row=len(fields), column=0, columnspan=2, sticky='w', pady=(4, 0))
+        ttk.Checkbutton(form, text='No sound (waterfall only)',
+                         variable=self._no_sound_var).grid(row=len(fields) + 1, column=0, columnspan=2, sticky='w')
         ttk.Checkbutton(form, text='Disabled (hide from SDR selector, keep in this list)',
-                         variable=self._disabled_var).grid(row=len(fields) + 1, column=0, columnspan=2, sticky='w')
+                         variable=self._disabled_var).grid(row=len(fields) + 2, column=0, columnspan=2, sticky='w')
 
         btns = ttk.Frame(self)
         btns.pack(pady=(0, 8))
@@ -1028,7 +1045,8 @@ class SdrEntryDialog(tk.Toplevel):
         if not name or not host:
             return
         self.result = {'name': name, 'host': host, 'port': port,
-                       'mimic_browser': self._mimic_var.get(), 'disabled': disabled}
+                       'mimic_browser': self._mimic_var.get(), 'no_sound': self._no_sound_var.get(),
+                       'disabled': disabled}
         self.destroy()
 
 
@@ -1060,8 +1078,9 @@ class SdrListDialog(tk.Toplevel):
         self._listbox.delete(0, 'end')
         for s in self._sdr_list:
             mimic = '  [mimic browser]' if s.get('mimic_browser') else ''
+            no_sound = '  [no sound]' if s.get('no_sound') else ''
             disabled = '  [disabled]' if s.get('disabled') else ''
-            self._listbox.insert('end', '%s  (%s:%s)%s%s' % (s['name'], s['host'], s['port'], mimic, disabled))
+            self._listbox.insert('end', '%s  (%s:%s)%s%s%s' % (s['name'], s['host'], s['port'], mimic, no_sound, disabled))
 
     def _save(self):
         save_sdr_list(self._list_path, self._sdr_list)
@@ -1261,8 +1280,14 @@ class PanadapterApp:
         with self._freq_lock:
             freq = self._current_freq_khz if self._current_freq_khz is not None else self._options.default_freq
         mimic_browser = sdr_entry.get('mimic_browser', False)
+        no_sound = sdr_entry.get('no_sound', False)
 
-        if mimic_browser:
+        if no_sound:
+            # Audio channel intentionally skipped for this SDR (e.g.
+            # Weston's still-unexplained ~10s audio-channel disconnect,
+            # investigation parked) -- waterfall only, no pairing needed.
+            self._start_wf_connection(sdr_entry, freq, mimic_browser)
+        elif mimic_browser:
             # A real browser always opens its SND connection before its W/F
             # one (confirmed via packet capture, 2026-07-30: SND SYN then
             # W/F SYN ~249ms later) -- live-tested as working reliably in
