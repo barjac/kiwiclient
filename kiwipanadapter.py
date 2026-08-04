@@ -15,10 +15,12 @@
 # audio no longer needs a separately-spawned kiwiclientd.py process.
 
 import argparse
+import http.client
 import logging
 import math
 import os
 import queue
+import re
 import socket
 import threading
 import time
@@ -90,6 +92,65 @@ BROWSER_MIMIC_HEADER_ORDER = [
     'Sec-WebSocket-Key', 'DNT', 'Connection', 'Pragma', 'Cache-Control',
     'Upgrade',
 ]
+
+# KiwiSDR's own server source (support/stats.cpp, github.com/jks-prv/KiwiSDR)
+# runs an "External API" check EXT_API_DECISION_SECS (10s) after each
+# connection arrives: if that source IP hasn't been served >=
+# EXT_API_DECISION_SERVED (3) plain HTTP requests (the index page + its JS/
+# CSS assets, exactly what a real browser tab fetches before ever opening a
+# WebSocket), the connection is tagged 'ext_api' (non-Kiwi app) and, on
+# Kiwis with ext_api_nchans configured low (0 on Weston), gets a clean
+# too_busy kick -- repeating every ~10s since each reconnect resets the
+# 10s clock. None of mimic_browser's other header/protocol mimicry touches
+# this counter, which is why they had no effect on that kick. This fetches
+# the index page plus a couple of its referenced assets first, so the same
+# source IP clears the served>=3 threshold before any WS connects.
+BROWSER_MIMIC_PREFETCH_ASSET_RE = re.compile(r'''(?:src|href)=["']([^"'?]+\.(?:js|css))["']''')
+
+
+def _browser_mimic_fetch(host, port, url, headers, timeout):
+    """One GET on its own fresh connection. Despite advertising
+    'Connection: keep-alive', a real KiwiSDR's embedded Mongoose server was
+    observed live (websdr.uk:8076) to reliably drop the socket after the
+    first request of a reused connection (RemoteDisconnected, 3/3) -- so
+    each request gets its own connection rather than trying to pipeline."""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request('GET', url, headers=headers)
+        resp = conn.getresponse()
+        return resp.read()
+    finally:
+        conn.close()
+
+
+def browser_mimic_prefetch(host, port, timeout=3.0):
+    headers = {}
+    for h in BROWSER_MIMIC_HEADERS:
+        name, _, value = h.partition(': ')
+        headers[name] = value
+
+    try:
+        body = _browser_mimic_fetch(host, port, '/', headers, timeout).decode('utf-8', errors='replace')
+    except Exception as e:
+        logging.debug('mimic_browser prefetch of %s:%s/ failed: %s', host, port, e)
+        return
+
+    asset_urls = []
+    for m in BROWSER_MIMIC_PREFETCH_ASSET_RE.finditer(body):
+        url = m.group(1)
+        if url.startswith('http') or url.startswith('//'):
+            continue
+        if not url.startswith('/'):
+            url = '/' + url
+        if url not in asset_urls:
+            asset_urls.append(url)
+
+    for url in asset_urls[:3]:
+        try:
+            _browser_mimic_fetch(host, port, url, headers, timeout)
+        except Exception as e:
+            logging.debug('mimic_browser prefetch of %s:%s%s failed: %s', host, port, url, e)
+
 
 def parse_bool(val):
     return val.strip().lower() in ('1', 'true', 'yes', 'on')
@@ -1281,6 +1342,9 @@ class PanadapterApp:
             freq = self._current_freq_khz if self._current_freq_khz is not None else self._options.default_freq
         mimic_browser = sdr_entry.get('mimic_browser', False)
         no_sound = sdr_entry.get('no_sound', False)
+
+        if mimic_browser:
+            browser_mimic_prefetch(sdr_entry['host'], sdr_entry['port'])
 
         if no_sound:
             # Audio channel intentionally skipped for this SDR (e.g.
