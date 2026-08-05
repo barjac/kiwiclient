@@ -1242,6 +1242,7 @@ class PanadapterApp:
         self._reconnect_retry_count = 0
         self._reconnect_after_id = None
         self._stream_start_ts = None
+        self._stopped = False
 
         root.title('Kiwi Panadapter')
         self._build_ui()
@@ -1279,6 +1280,8 @@ class PanadapterApp:
                                         values=[s['name'] for s in self._enabled_sdrs()])
         self._sdr_combo.pack(side='left', padx=4)
         self._sdr_combo.bind('<<ComboboxSelected>>', self._on_sdr_change)
+        self._stop_btn_var = tk.StringVar(value='Stop')
+        ttk.Button(top, textvariable=self._stop_btn_var, command=self._toggle_stream, width=6).pack(side='left', padx=4)
         ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left')
 
         self._status_var = tk.StringVar(value='connecting...')
@@ -1466,12 +1469,7 @@ class PanadapterApp:
 
         self._reconnect_after_id = self._root.after(int(RECONNECT_RETRY_DELAY_SEC * 1000), do_reconnect)
 
-    def _on_sdr_change(self, _event):
-        name = self._sdr_var.get()
-        entry = next((s for s in self._sdr_list if s['name'] == name), None)
-        if entry is None:
-            return
-        self._stop_stream()
+    def _reset_display_state(self):
         while True:
             try:
                 self._row_queue.get_nowait()
@@ -1484,13 +1482,46 @@ class PanadapterApp:
         self._smeter_peak_set_ts = None
         self._smeter_peak_last_ts = None
         self._wf_auto_floor_dbm = None
-        self._reconnect_retry_count = 0
-        self._start_stream(entry)
-        self._active_sdr = entry
+
+    def _on_sdr_change(self, _event):
+        name = self._sdr_var.get()
+        entry = next((s for s in self._sdr_list if s['name'] == name), None)
+        if entry is None:
+            return
         try:
             save_config_value(self._options.config, 'last_sdr', entry['name'])
         except Exception as e:
             logging.debug('failed to save last_sdr: %s', e)
+        if self._stopped:
+            return   # just remember the selection -- Start will connect to it
+        self._stop_stream()
+        self._reset_display_state()
+        self._reconnect_retry_count = 0
+        self._start_stream(entry)
+        self._active_sdr = entry
+
+    def _toggle_stream(self):
+        if self._stopped:
+            name = self._sdr_var.get()
+            entry = next((s for s in self._sdr_list if s['name'] == name), None)
+            if entry is None:
+                return
+            self._reset_display_state()
+            self._reconnect_retry_count = 0
+            self._start_stream(entry)
+            self._active_sdr = entry
+            self._stopped = False
+            self._stop_btn_var.set('Stop')
+        else:
+            self._stop_stream()
+            self._active_sdr = None
+            self._stopped = True
+            self._reset_display_state()
+            self._redraw()
+            self._freq_var.set('-- kHz')
+            self._dbm_var.set('-- dBm')
+            self._status_var.set('stopped')
+            self._stop_btn_var.set('Start')
 
     def _enabled_sdrs(self):
         return [s for s in self._sdr_list if not s.get('disabled')]
