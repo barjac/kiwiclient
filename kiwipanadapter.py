@@ -156,6 +156,54 @@ def parse_bool(val):
     return val.strip().lower() in ('1', 'true', 'yes', 'on')
 
 
+def parse_float_list(val):
+    return [float(x.strip()) for x in val.split(',') if x.strip()]
+
+
+# Amateur band names offered by the Band combo, in the order they're listed --
+# each has a matching 'band_<name>_khz' CONFIG_SCHEMA/argparse entry below.
+# Default centers are just sane, easily-edited placeholders (a mix of typical
+# SSB/data calling areas), not an authoritative band plan.
+BAND_NAMES = ['10m', '12m', '15m', '17m', '20m', '30m', '40m', '60m', '80m', '160m']
+BAND_DEFAULT_KHZ = {
+    '10m': 28400.0, '12m': 24920.0, '15m': 21200.0, '17m': 18100.0, '20m': 14200.0,
+    '30m': 10130.0, '40m': 7100.0, '60m': 5340.0, '80m': 3700.0, '160m': 1900.0,
+}
+# Conventional voice mode per band -- LSB below 10 MHz, USB above, except 60m
+# (channelized, USB by international convention despite being below 10 MHz).
+# Applied as the Mode combo's default whenever Band changes -- still
+# overridable afterwards via the Mode combo itself.
+BAND_DEFAULT_MODE = {
+    '10m': 'usb', '12m': 'usb', '15m': 'usb', '17m': 'usb', '20m': 'usb',
+    '30m': 'usb', '40m': 'lsb', '60m': 'usb', '80m': 'lsb', '160m': 'lsb',
+}
+
+# B/W combo presets: each is a (center_hz, width_hz) pair defining the audio
+# demod passband -- configurable via 'bw_<name>_center_hz'/'bw_<name>_width_hz'.
+# 'FreeDV' defaults match the existing smeter_passband_* defaults; 'CW'
+# defaults to a narrow filter around a typical sidetone pitch.
+BW_NAMES = ['SSB', 'FreeDV', 'CW']
+BW_DEFAULT_HZ = {
+    'SSB': (1500.0, 3000.0),
+    'FreeDV': (1500.0, 2400.0),
+    'CW': (750.0, 500.0),
+}
+
+MODE_NAMES = ['USB', 'LSB', 'AM']
+
+# Mirrors kiwi/client.py's own (private, per-instance) _default_passbands
+# table -- used here only to draw the yellow passband indicator for Auto/
+# rigctl-driven modes, where only a highcut width (not a full lowcut/highcut
+# pair) is ever known locally; never sent to the server.
+DEFAULT_PASSBANDS_HZ = {
+    'lsb': (-2700, -300), 'lsn': (-2400, -300),
+    'usb': (300, 2700), 'usn': (300, 2400),
+    'cw': (300, 700), 'cwn': (470, 530),
+    'nbfm': (-6000, 6000), 'nnfm': (-3000, 3000),
+}
+
+DEFAULT_ZOOM_STEPS_KHZ = [250.0, 100.0, 50.0, 20.0, 10.0]
+
 # Adjustable settings that live in the flat text config file, with their types
 CONFIG_SCHEMA = {
     'span_khz': float,
@@ -192,7 +240,19 @@ CONFIG_SCHEMA = {
     'de_emp': parse_bool,
     'resample': int,
     'ifreq': float,
+    'manual_active': parse_bool,
+    'manual_freq_khz': float,
+    'manual_band': str,
+    'manual_mode': str,
+    'manual_bw': str,
+    'zoom_span_khz': float,
+    'zoom_steps_khz': parse_float_list,
 }
+for _name in BAND_NAMES:
+    CONFIG_SCHEMA['band_%s_khz' % _name] = float
+for _name in BW_NAMES:
+    CONFIG_SCHEMA['bw_%s_center_hz' % _name.lower()] = float
+    CONFIG_SCHEMA['bw_%s_width_hz' % _name.lower()] = float
 
 
 def zoom_for_span(span_khz, max_freq_khz=MAX_FREQ_KHZ, max_zoom=14):
@@ -215,6 +275,31 @@ def nearest_resize(img, new_h, new_w):
     row_idx = (np.arange(new_h) * src_h // new_h).astype(np.intp)
     col_idx = (np.arange(new_w) * src_w // new_w).astype(np.intp)
     return img[row_idx][:, col_idx]
+
+
+def nice_tick_step(span_khz, target_ticks=8):
+    """Pick a "nice" (1-2-5 progression) major tick step for a given span, so
+    the frequency axis stays readable across widely different Span levels
+    (10 kHz to 250+ kHz) instead of the old fixed 5/1 kHz spacing crowding or
+    thinning out. Minor step subdivides the major step into a round number
+    matching its leading digit -- 1 and 5 split cleanly into 5 (0.2/1 sub-
+    steps), but 2 doesn't (2/5 = 0.4, not a round number to read by eye), so
+    it splits into 4 (0.5 sub-steps) instead."""
+    if span_khz <= 0:
+        return (1.0, 5.0)
+    raw = span_khz / target_ticks
+    exp = math.floor(math.log10(raw))
+    base = 10 ** exp
+    major = 10 * base
+    divisions = 5
+    mult_divisions = {1: 5, 2: 4, 5: 5, 10: 5}
+    for mult in (1, 2, 5, 10):
+        step = mult * base
+        if step >= raw:
+            major = step
+            divisions = mult_divisions[mult]
+            break
+    return (major / divisions, major)
 
 
 def tick_positions(start_khz, stop_khz, step):
@@ -353,6 +438,23 @@ def load_config(path):
             f.write("modulation      usb\n")
             f.write("ncomp           false\n")
             f.write("# sounddevice  name  -- run --ls-snd to list available sound devices\n")
+            f.write("\n# Manual tuning (Auto/Manual toggle) -- last state, restored at startup\n")
+            f.write("manual_active   false\n")
+            f.write("manual_freq_khz %s\n" % BAND_DEFAULT_KHZ['40m'])
+            f.write("manual_band     40m\n")
+            f.write("manual_mode     usb\n")
+            f.write("manual_bw       FreeDV\n")
+            f.write("zoom_span_khz   50\n")
+            f.write("zoom_steps_khz  %s\n" % ','.join(str(int(s)) for s in DEFAULT_ZOOM_STEPS_KHZ))
+            f.write("\n# Band combo centers (kHz) -- edit freely, these are just placeholders\n")
+            for _name in BAND_NAMES:
+                f.write("band_%-6s %s\n" % (_name + '_khz', BAND_DEFAULT_KHZ[_name]))
+            f.write("\n# B/W combo passband presets (Hz)\n")
+            for _name in BW_NAMES:
+                center, width = BW_DEFAULT_HZ[_name]
+                key = _name.lower()
+                f.write("bw_%s_center_hz  %s\n" % (key, center))
+                f.write("bw_%s_width_hz   %s\n" % (key, width))
     cfg = {}
     with open(path) as f:
         for line in f:
@@ -587,9 +689,22 @@ class LiveWFStream(KiwiSDRStream):
         self._actual_span_khz = span_for_zoom(self._zoom)
         self._row_queue = row_queue
         self._pending_freq = None
+        self._pending_span_khz = None
         self._lock = threading.Lock()
 
     def _setup_rx_params(self):
+        # self.MAX_FREQ (kiwi/client.py's KiwiSDRStream) starts at the 30 MHz
+        # default set before any connection exists, and only gets corrected
+        # to this Kiwi's real per-unit value -- e.g. 32 MHz, an admin-
+        # configurable "max_freq" setting some Kiwis use -- once the
+        # server's own 'bandwidth' MSG has been processed during the
+        # handshake that precedes this call. Recompute zoom/span here rather
+        # than trusting the __init__-time guess: using the wrong constant is
+        # invisible exactly at the tuned/center frequency (zero offset times
+        # any wrong scale is still zero) but produces a growing frequency
+        # error away from center -- e.g. 30 vs 32 MHz is a 6.25% span error.
+        self._zoom = zoom_for_span(self._span_khz, max_freq_khz=self.MAX_FREQ)
+        self._actual_span_khz = span_for_zoom(self._zoom, max_freq_khz=self.MAX_FREQ)
         self.set_freq(self._freq)
         baseband_freq = self._remove_freq_offset(self._freq)
         self._set_zoom_cf(self._zoom, baseband_freq)
@@ -603,12 +718,29 @@ class LiveWFStream(KiwiSDRStream):
         with self._lock:
             self._pending_freq = freq_khz
 
+    def set_span(self, span_khz):
+        with self._lock:
+            self._pending_span_khz = span_khz
+
     def _process_waterfall_samples(self, seq, samples):
         with self._lock:
             pending = self._pending_freq
             self._pending_freq = None
-        if pending is not None and pending != self._freq:
+            pending_span = self._pending_span_khz
+            self._pending_span_khz = None
+
+        zoom_changed = False
+        if pending_span is not None and pending_span != self._span_khz:
+            self._span_khz = pending_span
+            self._zoom = zoom_for_span(pending_span, max_freq_khz=self.MAX_FREQ)
+            self._actual_span_khz = span_for_zoom(self._zoom, max_freq_khz=self.MAX_FREQ)
+            zoom_changed = True
+
+        freq_changed = pending is not None and pending != self._freq
+        if freq_changed:
             self._freq = pending
+
+        if freq_changed or zoom_changed:
             try:
                 self._set_zoom_cf(self._zoom, self._remove_freq_offset(self._freq))
             except Exception as e:
@@ -653,6 +785,7 @@ class LiveAudioStream(KiwiSDRStream):
         self._freq = initial_freq_khz
         self._pending_freq = None
         self._pending_mode = None
+        self._pending_manual = None
         self._lock = threading.Lock()
 
         # Live demod mode -- unlike a static CLI-driven recorder, this is
@@ -710,15 +843,39 @@ class LiveAudioStream(KiwiSDRStream):
         with self._lock:
             self._pending_mode = (mod, passband_hz)
 
+    def set_manual_passband(self, mod, lowcut_hz, highcut_hz):
+        """Independent passband path for the Manual Mode/B-W combos -- unlike
+        set_mode() above (driven by rigctl's single passband-width value,
+        lowcut always reset to None/server-default), this takes an explicit
+        lowcut/highcut pair so a preset like CW can center its narrow filter
+        away from the dial frequency. Kept as a separate pending slot rather
+        than reshaping _pending_mode so the rigctl-driven Auto path above is
+        untouched."""
+        if mod:
+            mod = mod.lower()
+            if mod == 'pktusb':
+                mod = 'usb'
+        with self._lock:
+            self._pending_manual = (mod, lowcut_hz, highcut_hz)
+
     def _apply_pending_retune(self):
         with self._lock:
             pending_freq = self._pending_freq
             self._pending_freq = None
             pending_mode = self._pending_mode
             self._pending_mode = None
+            pending_manual = self._pending_manual
+            self._pending_manual = None
 
         mode_changed = False
-        if pending_mode is not None:
+        if pending_manual is not None:
+            mod, lowcut_hz, highcut_hz = pending_manual
+            if mod and (mod != self._modulation or lowcut_hz != self._lowcut or highcut_hz != self._highcut):
+                self._modulation = mod
+                self._lowcut = lowcut_hz
+                self._highcut = highcut_hz
+                mode_changed = True
+        elif pending_mode is not None:
             mod, passband_hz = pending_mode
             if mod and (mod != self._modulation or passband_hz != self._highcut):
                 self._modulation = mod
@@ -1122,12 +1279,15 @@ class SdrListDialog(tk.Toplevel):
         self._list_path = list_path
         self._on_change = on_change
 
-        self._listbox = tk.Listbox(self, width=44, height=8)
-        self._listbox.pack(side='top', fill='both', expand=True, padx=8, pady=8)
+        # Wide/tall enough that a full "name  (host:port)  [mimic browser]
+        # [no sound] [disabled]" line and the current SDR count both fit
+        # without cropping or needing an initial resize.
+        self._listbox = tk.Listbox(self, width=90, height=14)
+        self._listbox.pack(side='top', fill='both', expand=True, padx=12, pady=12)
         self._refresh_listbox()
 
         btns = ttk.Frame(self)
-        btns.pack(side='top', fill='x', padx=8, pady=(0, 8))
+        btns.pack(side='top', fill='x', padx=12, pady=(0, 12))
         ttk.Button(btns, text='Add', command=self._add).pack(side='left')
         ttk.Button(btns, text='Edit', command=self._edit).pack(side='left', padx=4)
         ttk.Button(btns, text='Delete', command=self._delete).pack(side='left')
@@ -1244,6 +1404,38 @@ class PanadapterApp:
         self._stream_start_ts = None
         self._stopped = False
 
+        # Manual tuning state -- self._manual is the single global Auto/Manual
+        # gate; while True, _on_rigctl_freq/_on_rigctl_mode below are ignored
+        # and Band/Mode/B-W/drag-tune own the frequency instead. The
+        # remembered manual_* values persist to config immediately on change
+        # (like last_sdr) so a short trip back to Auto and forth, or a full
+        # app restart, never loses them.
+        self._manual = options.manual_active
+        self._manual_freq_khz = options.manual_freq_khz
+        self._manual_band = options.manual_band
+        self._manual_mode = options.manual_mode
+        self._manual_bw = options.manual_bw
+        self._zoom_span_khz = options.zoom_span_khz
+        self._zoom_steps_khz = options.zoom_steps_khz
+        self._band_khz = {name: getattr(options, 'band_%s_khz' % name) for name in BAND_NAMES}
+        self._bw_hz = {name: (getattr(options, 'bw_%s_center_hz' % name.lower()),
+                               getattr(options, 'bw_%s_width_hz' % name.lower())) for name in BW_NAMES}
+        # Transient drag-to-tune state (see _on_wf_drag_*) -- not persisted.
+        self._drag_start_x = None
+        self._drag_start_freq_khz = None
+        self._drag_freq_khz = None
+        self._drag_last_dx = 0
+
+        # Currently-active demod passband, as lowcut/highcut Hz offsets from
+        # the dial frequency -- kept in sync by _apply_manual_passband
+        # (Manual) and _on_rigctl_mode (Auto), purely to draw the yellow
+        # passband indicator; never fed back into any retune logic.
+        self._pb_lowcut_hz = None
+        self._pb_highcut_hz = None
+
+        if self._manual:
+            self._current_freq_khz = self._manual_freq_khz
+
         root.title('Kiwi Panadapter')
         self._build_ui()
         root.update_idletasks()   # so winfo_width/height are accurate before the first row arrives
@@ -1272,6 +1464,15 @@ class PanadapterApp:
         top = ttk.Frame(self._root)
         top.pack(side='top', fill='x', padx=4, pady=4)
 
+        # Packed first (side='right') so it claims its space before any of
+        # the left-packed controls below -- otherwise, on a narrow screen,
+        # a growing left side (more combos added over time) can exhaust the
+        # bar's width and get this pushed off/cropped instead of just
+        # squeezing the left-side controls, which is the much less
+        # important side to lose room to.
+        self._freq_var = tk.StringVar(value='-- kHz')
+        ttk.Label(top, textvariable=self._freq_var, font=('TkFixedFont', 11, 'bold')).pack(side='right')
+
         ttk.Label(top, text='SDR:').pack(side='left')
         self._sdr_var = tk.StringVar(value=self._initial_sdr['name'])
         combo_width = max((len(s['name']) for s in self._sdr_list), default=10) + 2
@@ -1280,15 +1481,55 @@ class PanadapterApp:
                                         values=[s['name'] for s in self._enabled_sdrs()])
         self._sdr_combo.pack(side='left', padx=4)
         self._sdr_combo.bind('<<ComboboxSelected>>', self._on_sdr_change)
-        self._stop_btn_var = tk.StringVar(value='Stop')
-        ttk.Button(top, textvariable=self._stop_btn_var, command=self._toggle_stream, width=6).pack(side='left', padx=4)
-        ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left')
 
         self._status_var = tk.StringVar(value='connecting...')
-        ttk.Label(top, textvariable=self._status_var).pack(side='left', padx=12)
+        # Fixed width (like the S-meter's dBm label below) so "connecting to
+        # <name>..."/"connected"/"stopped" text changes don't shift Manage/
+        # Stop/Auto/the combos left and right as the status changes.
+        ttk.Label(top, textvariable=self._status_var, width=21, anchor='w').pack(side='left', padx=8)
 
-        self._freq_var = tk.StringVar(value='-- kHz')
-        ttk.Label(top, textvariable=self._freq_var, font=('TkFixedFont', 11, 'bold')).pack(side='right')
+        ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left')
+
+        self._stop_btn_var = tk.StringVar(value='Stop')
+        ttk.Button(top, textvariable=self._stop_btn_var, command=self._toggle_stream, width=6).pack(side='left', padx=4)
+
+        self._auto_btn_var = tk.StringVar(value=('Auto' if self._manual else 'Manual'))
+        ttk.Button(top, textvariable=self._auto_btn_var, command=self._toggle_auto_manual, width=7).pack(side='left', padx=4)
+
+        manual_combo_state = 'readonly' if self._manual else 'disabled'
+
+        ttk.Label(top, text='Span:').pack(side='left')
+        self._zoom_labels = [self._fmt_zoom_label(k) for k in self._zoom_steps_khz]
+        self._zoom_label_khz = dict(zip(self._zoom_labels, self._zoom_steps_khz))
+        self._zoom_var = tk.StringVar(value=self._fmt_zoom_label(self._zoom_span_khz))
+        if self._zoom_var.get() not in self._zoom_label_khz:
+            self._zoom_labels = [self._zoom_var.get()] + self._zoom_labels
+            self._zoom_label_khz[self._zoom_var.get()] = self._zoom_span_khz
+        self._zoom_combo = ttk.Combobox(top, textvariable=self._zoom_var, state='readonly',
+                                         width=9, values=self._zoom_labels)
+        self._zoom_combo.pack(side='left', padx=(2, 4))
+        self._zoom_combo.bind('<<ComboboxSelected>>', self._on_zoom_change)
+
+        ttk.Label(top, text='Band:').pack(side='left')
+        self._band_var = tk.StringVar(value=self._manual_band)
+        self._band_combo = ttk.Combobox(top, textvariable=self._band_var, state=manual_combo_state,
+                                         width=5, values=BAND_NAMES)
+        self._band_combo.pack(side='left', padx=(2, 4))
+        self._band_combo.bind('<<ComboboxSelected>>', self._on_band_change)
+
+        ttk.Label(top, text='Mode:').pack(side='left')
+        self._mode_var = tk.StringVar(value=self._manual_mode.upper())
+        self._mode_combo = ttk.Combobox(top, textvariable=self._mode_var, state=manual_combo_state,
+                                         width=5, values=MODE_NAMES)
+        self._mode_combo.pack(side='left', padx=(2, 4))
+        self._mode_combo.bind('<<ComboboxSelected>>', self._on_mode_change)
+
+        ttk.Label(top, text='B/W:').pack(side='left')
+        self._bw_var = tk.StringVar(value=self._manual_bw)
+        self._bw_combo = ttk.Combobox(top, textvariable=self._bw_var, state=manual_combo_state,
+                                       width=7, values=BW_NAMES)
+        self._bw_combo.pack(side='left', padx=(2, 4))
+        self._bw_combo.bind('<<ComboboxSelected>>', self._on_bw_change)
 
         # Fixed-height widgets must be packed to their side *before* the
         # expanding waterfall canvas, otherwise Tk's pack geometry manager
@@ -1313,13 +1554,16 @@ class PanadapterApp:
         self._canvas.bind('<Configure>', self._on_resize)
         self._sensitivity_var = tk.StringVar(value='Auto (adaptive)')
         self._canvas.bind('<Button-3>', self._show_sensitivity_menu)
+        self._canvas.bind('<ButtonPress-1>', self._on_wf_press)
+        self._canvas.bind('<B1-Motion>', self._on_wf_drag)
+        self._canvas.bind('<ButtonRelease-1>', self._on_wf_release)
 
     # -- SDR connection management -------------------------------------------------
 
     def _start_wf_connection(self, sdr_entry, freq, mimic_browser, ws_timestamp=None):
         wf_opt = make_stream_options(sdr_entry['host'], sdr_entry['port'], self._options,
                                       ws_offset=0, mimic_browser=mimic_browser, ws_timestamp=ws_timestamp)
-        self._wf_stream = LiveWFStream(wf_opt, freq, self._options.span, self._row_queue)
+        self._wf_stream = LiveWFStream(wf_opt, freq, self._zoom_span_khz, self._row_queue)
         self._run_event = threading.Event()
         self._run_event.set()
         wf_camp_wait_event = threading.Event()
@@ -1378,6 +1622,11 @@ class PanadapterApp:
 
         self._status_var.set('connecting to %s...' % sdr_entry['name'])
         self._stream_start_ts = time.time()
+        if self._manual:
+            # A freshly (re)created LiveAudioStream always starts with the
+            # global default modulation/passband -- reapply Manual's own
+            # Mode/B-W selection on top of it (SDR switch, Start, reconnect).
+            self._apply_manual_passband()
 
     def _stop_stream(self):
         if self._reconnect_after_id is not None:
@@ -1523,6 +1772,101 @@ class PanadapterApp:
             self._status_var.set('stopped')
             self._stop_btn_var.set('Start')
 
+    # -- Auto/Manual toggle + Zoom/Band/Mode/B-W combos -------------------------------
+
+    @staticmethod
+    def _fmt_zoom_label(nominal_khz):
+        # Labels with the span the Kiwi will actually deliver, not the raw
+        # requested value -- the Kiwi only offers power-of-two zoom steps,
+        # so e.g. a nominal "10 kHz" request really yields ~14.6 kHz on
+        # screen. The combo's stored value stays the nominal request (which
+        # resolves to the same zoom level either way -- see zoom_for_span/
+        # span_for_zoom), this only fixes the displayed text.
+        actual_khz = span_for_zoom(zoom_for_span(nominal_khz))
+        return ('%.1f kHz' % actual_khz)
+
+    def _set_manual_combo_states(self, manual):
+        state = 'readonly' if manual else 'disabled'
+        self._band_combo.config(state=state)
+        self._mode_combo.config(state=state)
+        self._bw_combo.config(state=state)
+
+    def _toggle_auto_manual(self):
+        if self._manual:
+            self._manual = False
+            self._auto_btn_var.set('Manual')
+        else:
+            self._manual = True
+            self._auto_btn_var.set('Auto')
+        try:
+            save_config_value(self._options.config, 'manual_active', self._manual)
+        except Exception as e:
+            logging.debug('failed to save manual_active: %s', e)
+        self._set_manual_combo_states(self._manual)
+        if self._manual:
+            self._apply_manual_state()
+
+    def _on_zoom_change(self, _event):
+        label = self._zoom_var.get()
+        span_khz = self._zoom_label_khz.get(label)
+        if span_khz is None:
+            return
+        self._zoom_span_khz = span_khz
+        try:
+            save_config_value(self._options.config, 'zoom_span_khz', span_khz)
+        except Exception as e:
+            logging.debug('failed to save zoom_span_khz: %s', e)
+        if self._wf_stream is not None:
+            self._wf_stream.set_span(span_khz)
+
+    def _on_band_change(self, _event):
+        name = self._band_var.get()
+        freq_khz = self._band_khz.get(name)
+        if freq_khz is None:
+            return
+        self._manual_band = name
+        try:
+            save_config_value(self._options.config, 'manual_band', name)
+        except Exception as e:
+            logging.debug('failed to save manual_band: %s', e)
+
+        default_mode = BAND_DEFAULT_MODE.get(name)
+        if default_mode is not None and default_mode != self._manual_mode:
+            self._manual_mode = default_mode
+            self._mode_var.set(default_mode.upper())
+            try:
+                save_config_value(self._options.config, 'manual_mode', default_mode)
+            except Exception as e:
+                logging.debug('failed to save manual_mode: %s', e)
+
+        if self._manual:
+            self._set_manual_freq(freq_khz)
+            self._apply_manual_passband()
+        else:
+            self._manual_freq_khz = freq_khz
+            try:
+                save_config_value(self._options.config, 'manual_freq_khz', freq_khz)
+            except Exception as e:
+                logging.debug('failed to save manual_freq_khz: %s', e)
+
+    def _on_mode_change(self, _event):
+        self._manual_mode = self._mode_var.get().lower()
+        try:
+            save_config_value(self._options.config, 'manual_mode', self._manual_mode)
+        except Exception as e:
+            logging.debug('failed to save manual_mode: %s', e)
+        if self._manual:
+            self._apply_manual_passband()
+
+    def _on_bw_change(self, _event):
+        self._manual_bw = self._bw_var.get()
+        try:
+            save_config_value(self._options.config, 'manual_bw', self._manual_bw)
+        except Exception as e:
+            logging.debug('failed to save manual_bw: %s', e)
+        if self._manual:
+            self._apply_manual_passband()
+
     def _enabled_sdrs(self):
         return [s for s in self._sdr_list if not s.get('disabled')]
 
@@ -1545,6 +1889,8 @@ class PanadapterApp:
     # -- frequency/mode tracking ------------------------------------------------------
 
     def _on_rigctl_freq(self, freq_khz):
+        if self._manual:
+            return   # Manual owns the frequency -- ignore FreeDV/rigctl until switched back to Auto
         with self._freq_lock:
             changed = self._current_freq_khz != freq_khz
             self._current_freq_khz = freq_khz
@@ -1555,8 +1901,89 @@ class PanadapterApp:
                 self._audio_stream.retune(freq_khz)
 
     def _on_rigctl_mode(self, mode, passband_hz):
+        if self._manual:
+            return   # Manual owns the mode/passband -- ignore FreeDV/rigctl until switched back to Auto
+        if mode and passband_hz is not None:
+            mod_key = mode.lower()
+            if mod_key == 'pktusb':
+                mod_key = 'usb'
+            if mod_key.startswith('am') or mod_key == 'sam':
+                # Matches LiveAudioStream's own symmetric-passband negation
+                # for AM (self._lowcut is otherwise ignored/reset for AM).
+                self._pb_lowcut_hz = -passband_hz
+                self._pb_highcut_hz = passband_hz
+            else:
+                # rigctl's passband_hz is a total *width*, not a directional
+                # offset -- for a lower-sideband-family mode that width has
+                # to land entirely below the dial (highcut near zero, lowcut
+                # further negative) or the indicator ends up spanning both
+                # sides like AM instead of sitting on the correct sideband.
+                # Reuse DEFAULT_PASSBANDS_HZ's own near-zero edge for
+                # whichever mode this is as the fixed guard offset, and
+                # apply the real reported width from there.
+                default_lo, default_hi = DEFAULT_PASSBANDS_HZ.get(mod_key, (None, None))
+                if default_lo is not None:
+                    if default_hi < 0:   # LSB-family: near-zero edge is the highcut
+                        self._pb_highcut_hz = default_hi
+                        self._pb_lowcut_hz = default_hi - passband_hz
+                    else:                # USB-family/CW: near-zero edge is the lowcut
+                        self._pb_lowcut_hz = default_lo
+                        self._pb_highcut_hz = default_lo + passband_hz
         if self._audio_stream is not None:
             self._audio_stream.set_mode(mode, passband_hz)
+
+    def _set_manual_freq(self, freq_khz, save=True):
+        """Apply a new Manual-mode frequency (from Band select or drag-release)
+        via the same retune path _on_rigctl_freq uses for Auto -- live-applies
+        only if a stream currently exists (no-op while stopped, matching
+        _on_sdr_change's "just remember it" precedent)."""
+        self._manual_freq_khz = freq_khz
+        if save:
+            try:
+                save_config_value(self._options.config, 'manual_freq_khz', freq_khz)
+            except Exception as e:
+                logging.debug('failed to save manual_freq_khz: %s', e)
+        with self._freq_lock:
+            self._current_freq_khz = freq_khz
+        if self._wf_stream is not None:
+            self._wf_stream.retune(freq_khz)
+        if self._audio_stream is not None:
+            self._audio_stream.retune(freq_khz)
+
+    def _apply_manual_passband(self):
+        """(Re-)send the current Mode+B/W combo selection to the audio stream
+        -- called whenever either combo changes, and when switching into
+        Manual. No-op while stopped (no audio stream to send to).
+
+        B/W presets are stored as a positive (center, width) offset from the
+        dial frequency -- correct as-is for USB/CW, but the Kiwi expects a
+        *negative* low_cut/high_cut range for LSB (its own default_passbands
+        table uses e.g. usb=[300,2700] vs lsb=[-2700,-300], a mirror image --
+        kiwi/client.py sends whatever sign it's given as a literal RF-offset
+        filter, it doesn't infer/flip anything from mod itself). Mirror to
+        negative here for LSB; AM's own symmetric-passband handling already
+        happens downstream in LiveAudioStream._apply_pending_retune."""
+        if self._audio_stream is None:
+            return
+        center_hz, width_hz = self._bw_hz.get(self._manual_bw, (0.0, 2400.0))
+        lowcut_hz = center_hz - width_hz / 2.0
+        highcut_hz = center_hz + width_hz / 2.0
+        if self._manual_mode == 'lsb':
+            lowcut_hz, highcut_hz = -highcut_hz, -lowcut_hz
+        elif self._manual_mode == 'am':
+            # Matches LiveAudioStream's own symmetric-passband negation for
+            # AM -- the lowcut actually sent ends up -highcut regardless of
+            # what's passed in, so track that here too for the indicator.
+            lowcut_hz = -highcut_hz
+        self._pb_lowcut_hz = lowcut_hz
+        self._pb_highcut_hz = highcut_hz
+        self._audio_stream.set_manual_passband(self._manual_mode, lowcut_hz, highcut_hz)
+
+    def _apply_manual_state(self):
+        """Re-apply the remembered Manual freq + Mode/B-W when switching
+        Auto -> Manual, so Manual resumes exactly where it left off."""
+        self._set_manual_freq(self._manual_freq_khz, save=False)
+        self._apply_manual_passband()
 
     # -- GUI update loop --------------------------------------------------------------
 
@@ -1708,34 +2135,142 @@ class PanadapterApp:
             self._draw_smeter(self._last_signal_dbm, self._smeter_peak_dbm)
 
         if self._last_start is not None:
-            self._draw_freq_axis(self._last_start, self._last_stop)
+            if self._drag_freq_khz is not None:
+                self._redraw_freq_axis_only()
+            else:
+                self._draw_freq_axis(self._last_start, self._last_stop)
 
-    def _draw_freq_axis(self, start_khz, stop_khz):
+    def _redraw_freq_axis_only(self):
+        """Cheap freq-axis-strip-only redraw used while drag-panning -- the
+        waterfall image itself is already panned in place via canvas.coords,
+        no need to rebuild it here."""
+        if self._drag_freq_khz is None or self._last_start is None:
+            return
+        span = self._last_stop - self._last_start
+        self._draw_freq_axis(self._drag_freq_khz - span / 2, self._drag_freq_khz + span / 2,
+                              marker_freq=self._drag_freq_khz, marker_color='red')
+
+    def _draw_freq_axis(self, start_khz, stop_khz, marker_freq=None, marker_color='#ff00ff'):
         # Axis sits above the waterfall, so ticks point down toward it (at
         # the strip's bottom edge) with labels above them.
         c = self._freqaxis_canvas
         c.delete('all')
-        w = max(1, c.winfo_width())
+        # Deliberately self._canvas's width, not c's own -- the waterfall
+        # image (and all the drag-pan pixel math in _on_wf_drag/_on_wf_release/
+        # _shift_img_buf) is authoritatively sized off self._canvas.winfo_width().
+        # Both canvases are laid out to always be the same width, but tick/
+        # marker math drifting out of step with the image if that ever isn't
+        # exactly true (even by a pixel) is exactly the kind of small,
+        # drag-distance-proportional misalignment reported against a real
+        # carrier -- querying the same canvas everywhere removes that
+        # possibility outright rather than relying on two widgets staying in
+        # sync.
+        w = max(1, self._canvas.winfo_width())
         h = max(1, c.winfo_height())
         span = stop_khz - start_khz
         if span <= 0:
             return
 
-        for f in tick_positions(start_khz, stop_khz, self._freq_minor_khz):
+        minor_khz, major_khz = nice_tick_step(span)
+
+        for f in tick_positions(start_khz, stop_khz, minor_khz):
             x = int((f - start_khz) / span * w)
             c.create_line(x, h, x, h - 6, fill='#a0a0a0', width=2)
 
-        label_fmt = '%.3f' if self._freq_major_khz < 1 else '%.0f'
-        for f in tick_positions(start_khz, stop_khz, self._freq_major_khz):
+        label_fmt = '%.3f' if major_khz < 1 else '%.0f'
+        for f in tick_positions(start_khz, stop_khz, major_khz):
             x = int((f - start_khz) / span * w)
             c.create_line(x, h, x, h - 6, fill='#a0a0a0', width=2)
             c.create_text(x, h - 7, text=label_fmt % f, fill='white', anchor='s', font=('TkFixedFont', 7))
 
+        if marker_freq is None:
+            with self._freq_lock:
+                marker_freq = self._current_freq_khz
+        if marker_freq is not None and start_khz <= marker_freq <= stop_khz:
+            x = int((marker_freq - start_khz) / span * w)
+            c.create_line(x, 0, x, h, fill=marker_color, width=1)
+
+        # Passband indicator: a thin yellow line just above the waterfall's
+        # top edge (this strip's bottom row), spanning the active demod
+        # filter's lowcut..highcut, positioned relative to the dial/marker
+        # frequency -- its length is the bandwidth, its position is where
+        # that passband actually sits in absolute frequency.
+        if marker_freq is not None and self._pb_lowcut_hz is not None and self._pb_highcut_hz is not None:
+            lo_khz = marker_freq + self._pb_lowcut_hz / 1000.0
+            hi_khz = marker_freq + self._pb_highcut_hz / 1000.0
+            x0 = int((lo_khz - start_khz) / span * w)
+            x1 = int((hi_khz - start_khz) / span * w)
+            if x1 != x0:
+                c.create_line(x0, h - 1, x1, h - 1, fill='yellow', width=3)
+
+    # -- drag-to-tune: grab-and-pan the waterfall under a fixed center marker -------
+
+    def _shift_img_buf(self, canvas_dx):
+        """Bake a drag's visual pan (canvas.coords, purely cosmetic and reset
+        on release) permanently into self._img_buf's actual pixel columns,
+        so already-buffered history rows line up with the new tuned center
+        instead of reverting to their old (pre-drag) alignment the instant
+        the live preview's coords offset is reset. canvas_dx is in on-screen
+        canvas pixels; self._img_buf is at the smaller native WF_NATIVE_BINS
+        resolution, so it's converted first."""
+        if not canvas_dx:
+            return
+        canvas_w = max(1, self._canvas.winfo_width())
+        native_w = self._img_buf.shape[1]
+        native_dx = int(round(canvas_dx * native_w / canvas_w))
+        if native_dx == 0:
+            return
+        if abs(native_dx) >= native_w:
+            self._img_buf[:] = 0
+            return
+        self._img_buf[:] = np.roll(self._img_buf, native_dx, axis=1)
+        if native_dx > 0:
+            self._img_buf[:, :native_dx] = 0
+        else:
+            self._img_buf[:, native_dx:] = 0
+
+    def _on_wf_press(self, event):
+        if not self._manual:
+            return
+        self._drag_start_x = event.x
+        self._drag_last_dx = 0
         with self._freq_lock:
-            freq = self._current_freq_khz
-        if freq is not None and start_khz <= freq <= stop_khz:
-            x = int((freq - start_khz) / span * w)
-            c.create_line(x, 0, x, h, fill='#ff00ff', width=1)
+            self._drag_start_freq_khz = self._current_freq_khz
+
+    def _on_wf_drag(self, event):
+        if not self._manual or self._drag_start_x is None or self._drag_start_freq_khz is None:
+            return
+        canvas_w = max(1, self._canvas.winfo_width())
+        span_khz = (self._last_stop - self._last_start) if self._last_start is not None else self._zoom_span_khz
+        dx = event.x - self._drag_start_x
+        self._drag_last_dx = dx
+        self._drag_freq_khz = self._drag_start_freq_khz - (dx / canvas_w) * span_khz
+        self._canvas.coords(self._image_id, dx, 0)
+        self._redraw_freq_axis_only()
+
+    def _on_wf_release(self, event):
+        if not self._manual or self._drag_start_x is None:
+            return
+        final_freq = self._drag_freq_khz
+        dx = self._drag_last_dx
+        self._drag_start_x = None
+        self._drag_start_freq_khz = None
+        self._drag_freq_khz = None
+        self._drag_last_dx = 0
+        if final_freq is not None:
+            self._shift_img_buf(dx)
+            if self._last_start is not None:
+                span = self._last_stop - self._last_start
+                # Optimistic re-centering so the very next redraw (before the
+                # first real post-retune row arrives) is already self-
+                # consistent -- overwritten for real a moment later once
+                # LiveWFStream's own _process_waterfall_samples reports the
+                # genuine new start/stop.
+                self._last_start = final_freq - span / 2
+                self._last_stop = final_freq + span / 2
+            self._set_manual_freq(final_freq)
+        self._canvas.coords(self._image_id, 0, 0)
+        self._redraw()
 
     def _draw_smeter(self, dbm, peak_dbm=None):
         c = self._smeter_canvas
@@ -1892,6 +2427,42 @@ def parse_args():
     p.add_argument('--if', dest='ifreq', type=float, default=cfg.get('ifreq', None),
                     help='intermediate frequency shift in Hz, only valid with modulation=iq -- for '
                          'IQ-in/IQ-out workflows such as feeding raw I/Q into FreeDV transmit (config: ifreq)')
+    p.add_argument('--manual-active', dest='manual_active', action='store_true',
+                    default=cfg.get('manual_active', False),
+                    help='start in Manual tuning mode instead of Auto (following rigctl) '
+                         '(config: manual_active, default false)')
+    p.add_argument('--manual-freq', dest='manual_freq_khz', type=float,
+                    default=cfg.get('manual_freq_khz', BAND_DEFAULT_KHZ['40m']),
+                    help='last/initial Manual-mode frequency in kHz (config: manual_freq_khz)')
+    p.add_argument('--manual-band', dest='manual_band', default=cfg.get('manual_band', '40m'),
+                    choices=BAND_NAMES, help='last/initial Band combo selection (config: manual_band)')
+    p.add_argument('--manual-mode', dest='manual_mode', default=cfg.get('manual_mode', 'usb'),
+                    help='last/initial Mode combo selection (config: manual_mode)')
+    p.add_argument('--manual-bw', dest='manual_bw', default=cfg.get('manual_bw', 'FreeDV'),
+                    help='last/initial B/W combo selection (config: manual_bw)')
+    p.add_argument('--zoom-span', dest='zoom_span_khz', type=float,
+                    default=cfg.get('zoom_span_khz', cfg.get('span_khz', 50.0)),
+                    help='last/initial Zoom combo span in kHz, used in both Auto and Manual '
+                         '(config: zoom_span_khz)')
+    p.add_argument('--zoom-steps', dest='zoom_steps_khz', type=parse_float_list,
+                    default=cfg.get('zoom_steps_khz', DEFAULT_ZOOM_STEPS_KHZ),
+                    help='comma list of Zoom combo span steps in kHz (config: zoom_steps_khz, '
+                         'default %s)' % ','.join(str(int(s)) for s in DEFAULT_ZOOM_STEPS_KHZ))
+    for _name in BAND_NAMES:
+        _key = 'band_%s_khz' % _name
+        p.add_argument('--%s' % _key.replace('_', '-'), dest=_key, type=float,
+                        default=cfg.get(_key, BAND_DEFAULT_KHZ[_name]),
+                        help='Band combo center frequency for %s, in kHz (config: %s)' % (_name, _key))
+    for _name in BW_NAMES:
+        _key = _name.lower()
+        _default_center, _default_width = BW_DEFAULT_HZ[_name]
+        p.add_argument('--bw-%s-center' % _key, dest='bw_%s_center_hz' % _key, type=float,
+                        default=cfg.get('bw_%s_center_hz' % _key, _default_center),
+                        help='B/W combo "%s" passband center offset from dial frequency, in Hz '
+                             '(config: bw_%s_center_hz)' % (_name, _key))
+        p.add_argument('--bw-%s-width' % _key, dest='bw_%s_width_hz' % _key, type=float,
+                        default=cfg.get('bw_%s_width_hz' % _key, _default_width),
+                        help='B/W combo "%s" passband width, in Hz (config: bw_%s_width_hz)' % (_name, _key))
     p.add_argument('--log-level', default='warn', choices=['debug', 'info', 'warn', 'error'])
     return p.parse_args()
 
