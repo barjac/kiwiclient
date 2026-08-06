@@ -1,0 +1,82 @@
+# kiwipanadapter adjustable settings ('key value' per line, '#' comments)
+#
+# Copy this to panadapter.conf (or just let kiwipanadapter.py create one on
+# first run) and adjust for your own setup -- panadapter.conf itself is
+# gitignored since kiwipanadapter rewrites parts of it live as you use the
+# app (window position, last SDR selected, Manual-mode state), so tracking
+# that file directly would just be noise. This example carries real-world
+# tuning values/notes from actual use, not just code defaults.
+
+span_khz        24
+mindb           -120
+maxdb           -40
+
+# rigctl_host/rigctl_port are the source of truth for both frequency/mode --
+# a real rigctld talking to the shack radio. kiwipanadapter opens two
+# in-process Kiwi connections (waterfall + audio, LiveWFStream/
+# LiveAudioStream in kiwipanadapter.py) and retunes/remodes both directly
+# from rigctl polling -- no separate kiwiclientd process or mirrored
+# rigctld involved any more. (A single combined connection was tried and
+# reverted: some Kiwis only deliver waterfall data to a connection actually
+# opened as W/F, never to one opened as SND regardless of which commands
+# are sent on it.)
+rigctl_host     127.0.0.1
+rigctl_port     4532
+
+default_freq    5368.5
+smeter_decay_db_sec  6
+
+# Additive calibration offset for the computed S-meter reading -- tune
+# against a trusted reference (e.g. a webSDR on the same signal). Default
+# +12dB (2 S-units) since the panadapter's waterfall-derived reading ran
+# consistently ~2 S-units low against a webSDR's S-meter on a 60m digital
+# signal (2026-07-28).
+smeter_cal_db  12
+
+# Peak-hold bar: freezes at the highest reading for smeter_peak_hold_sec,
+# then falls at smeter_peak_decay_db_sec -- catches brief SSB syllabic
+# peaks that the main (fast-decay) bar can blink past between row updates.
+smeter_peak_hold_sec  3
+smeter_peak_decay_db_sec  2
+
+# S-meter samples power over [dial_freq + center - bw/2, dial_freq + center + bw/2],
+# not at the dial frequency itself (SSB dial freq is the suppressed-carrier
+# edge, outside the actual passband). 1500/2400 = 300-2700Hz, the default USB
+# passband; tune to match whatever FreeDV mode you're actually running.
+smeter_passband_center_hz  1500
+smeter_passband_bw_hz      1600
+
+freq_major_khz  5
+freq_minor_khz  1
+ncomp           true
+modulation      usb
+# sounddevice  name  -- run --ls-snd to list available sound devices
+
+# Manual tuning (Auto/Manual toggle) -- last state, restored at startup
+manual_active   false
+manual_freq_khz 7100.0
+manual_band     40m
+manual_mode     usb
+manual_bw       FreeDV
+zoom_span_khz   50
+zoom_steps_khz  250,100,50,20,10
+
+# Band combo centers (kHz) -- edit freely, these are just placeholders
+band_10m_khz 28400.0
+band_12m_khz 24920.0
+band_15m_khz 21200.0
+band_17m_khz 18100.0
+band_20m_khz 14200.0
+band_30m_khz 10130.0
+band_40m_khz 7100.0
+band_60m_khz 5340.0
+band_80m_khz 3700.0
+band_160m_khz 1900.0
+
+# B/W combo passband presets (Hz)
+bw_ssb_center_hz  1500.0
+bw_ssb_width_hz   3000.0
+bw_freedv_center_hz  1500.0
+bw_freedv_width_hz   2400.0
+bw_cw_center_hz  750.0
+bw_cw_width_hz   500.0

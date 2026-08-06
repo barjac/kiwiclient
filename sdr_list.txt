@@ -1,0 +1,11 @@
+# name              host                     port    [mimic_browser] [no_sound]
+Northampton UK                web888.aprsinfo.com       6888
+Castlebar Mayo Eire - EI8IZ   web888.minish.org         8075
+# GM4DIJ Edinburgh UK           gm4dij.proxy.rx-888.com   8073
+Wessex - G8JNJ                wessex.zapto.org          8073  mimic_browser
+Chichester - G8URE            g8ure.ddns.net            8073  mimic_browser
+# Chester - G0DUB               kiwisdr.g0dub.uk          8073
+Weston                        websdr.uk                 8076  mimic_browser
+DB0WHM                        db0whm.hamnet.network     8073  mimic_browser
+Spalding Lincs - M0CKE        m0cke.proxy.kiwisdr.com   8073  mimic_browser
+G3SDR                         g3sdr.com                 8074  mimic_browser
