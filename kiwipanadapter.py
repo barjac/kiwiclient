@@ -250,6 +250,10 @@ CONFIG_SCHEMA = {
 }
 for _name in BAND_NAMES:
     CONFIG_SCHEMA['band_%s_khz' % _name] = float
+    # Per-band "where you left off" memory (see _on_band_change) -- distinct
+    # from band_<name>_khz above, which is the fixed preset center. Absent
+    # until a band's actually been visited and left in Manual.
+    CONFIG_SCHEMA['band_%s_last_khz' % _name] = float
 for _name in BW_NAMES:
     CONFIG_SCHEMA['bw_%s_center_hz' % _name.lower()] = float
     CONFIG_SCHEMA['bw_%s_width_hz' % _name.lower()] = float
@@ -1418,6 +1422,13 @@ class PanadapterApp:
         self._zoom_span_khz = options.zoom_span_khz
         self._zoom_steps_khz = options.zoom_steps_khz
         self._band_khz = {name: getattr(options, 'band_%s_khz' % name) for name in BAND_NAMES}
+        # "Where you left off" per band -- populated as bands are left (see
+        # _on_band_change) and saved on close, so switching back to a band
+        # within the same session (or a later one) returns to the exact
+        # frequency you were on there, not just the fixed preset above.
+        self._band_last_freq_khz = {name: getattr(options, 'band_%s_last_khz' % name)
+                                     for name in BAND_NAMES
+                                     if getattr(options, 'band_%s_last_khz' % name) is not None}
         self._bw_hz = {name: (getattr(options, 'bw_%s_center_hz' % name.lower()),
                                getattr(options, 'bw_%s_width_hz' % name.lower())) for name in BW_NAMES}
         # Transient drag-to-tune state (see _on_wf_drag_*) -- not persisted.
@@ -1821,9 +1832,20 @@ class PanadapterApp:
 
     def _on_band_change(self, _event):
         name = self._band_var.get()
-        freq_khz = self._band_khz.get(name)
+        if name == self._manual_band:
+            return   # re-selecting the already-active band -- nothing to do
+        freq_khz = self._band_last_freq_khz.get(name, self._band_khz.get(name))
         if freq_khz is None:
             return
+
+        # Remember exactly where we're leaving this band, for a same-session
+        # (and, since it's saved to config too, a later-session) return.
+        self._band_last_freq_khz[self._manual_band] = self._manual_freq_khz
+        try:
+            save_config_value(self._options.config, 'band_%s_last_khz' % self._manual_band, self._manual_freq_khz)
+        except Exception as e:
+            logging.debug('failed to save band_%s_last_khz: %s', self._manual_band, e)
+
         self._manual_band = name
         try:
             save_config_value(self._options.config, 'manual_band', name)
@@ -2308,6 +2330,13 @@ class PanadapterApp:
             save_config_value(self._options.config, 'window_y', self._root.winfo_y())
         except Exception as e:
             logging.debug('failed to save window geometry: %s', e)
+        if self._manual_band:
+            # Capture wherever we're sitting on the current band too, not
+            # just bands already left mid-session (see _on_band_change).
+            try:
+                save_config_value(self._options.config, 'band_%s_last_khz' % self._manual_band, self._manual_freq_khz)
+            except Exception as e:
+                logging.debug('failed to save band_%s_last_khz: %s', self._manual_band, e)
         self._rigctl_poller.stop()
         self._stop_stream()
         self._root.destroy()
@@ -2453,6 +2482,11 @@ def parse_args():
         p.add_argument('--%s' % _key.replace('_', '-'), dest=_key, type=float,
                         default=cfg.get(_key, BAND_DEFAULT_KHZ[_name]),
                         help='Band combo center frequency for %s, in kHz (config: %s)' % (_name, _key))
+        _last_key = 'band_%s_last_khz' % _name
+        p.add_argument('--%s' % _last_key.replace('_', '-'), dest=_last_key, type=float,
+                        default=cfg.get(_last_key, None),
+                        help='remembered last-used frequency for %s in kHz, used instead of the '
+                             'preset above once this band has been visited (config: %s)' % (_name, _last_key))
     for _name in BW_NAMES:
         _key = _name.lower()
         _default_center, _default_width = BW_DEFAULT_HZ[_name]
