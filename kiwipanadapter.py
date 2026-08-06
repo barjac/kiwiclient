@@ -837,6 +837,12 @@ class LiveAudioStream(KiwiSDRStream):
             self._pending_freq = freq_khz
 
     def set_mode(self, mod, passband_hz):
+        """Not currently called (2026-08-07) -- PanadapterApp._on_rigctl_mode
+        uses set_manual_passband() below instead, so Auto mode always uses
+        the FreeDV B/W preset's passband rather than rigctl's raw reported
+        width. Left in place rather than removed since that's an explicit
+        "for now" simplification, easy to revert by pointing
+        _on_rigctl_mode back at this."""
         if mod:
             mod = mod.lower()
             if mod == 'pktusb':
@@ -1925,34 +1931,21 @@ class PanadapterApp:
     def _on_rigctl_mode(self, mode, passband_hz):
         if self._manual:
             return   # Manual owns the mode/passband -- ignore FreeDV/rigctl until switched back to Auto
-        if mode and passband_hz is not None:
-            mod_key = mode.lower()
-            if mod_key == 'pktusb':
-                mod_key = 'usb'
-            if mod_key.startswith('am') or mod_key == 'sam':
-                # Matches LiveAudioStream's own symmetric-passband negation
-                # for AM (self._lowcut is otherwise ignored/reset for AM).
-                self._pb_lowcut_hz = -passband_hz
-                self._pb_highcut_hz = passband_hz
-            else:
-                # rigctl's passband_hz is a total *width*, not a directional
-                # offset -- for a lower-sideband-family mode that width has
-                # to land entirely below the dial (highcut near zero, lowcut
-                # further negative) or the indicator ends up spanning both
-                # sides like AM instead of sitting on the correct sideband.
-                # Reuse DEFAULT_PASSBANDS_HZ's own near-zero edge for
-                # whichever mode this is as the fixed guard offset, and
-                # apply the real reported width from there.
-                default_lo, default_hi = DEFAULT_PASSBANDS_HZ.get(mod_key, (None, None))
-                if default_lo is not None:
-                    if default_hi < 0:   # LSB-family: near-zero edge is the highcut
-                        self._pb_highcut_hz = default_hi
-                        self._pb_lowcut_hz = default_hi - passband_hz
-                    else:                # USB-family/CW: near-zero edge is the lowcut
-                        self._pb_lowcut_hz = default_lo
-                        self._pb_highcut_hz = default_lo + passband_hz
-        if self._audio_stream is not None:
-            self._audio_stream.set_mode(mode, passband_hz)
+        if mode:
+            # FreeDV's own modem passband is a fixed shape regardless of
+            # which sideband the rig happens to be set to for band
+            # convention (e.g. LSB below 10MHz, USB above/on 60m) -- for now
+            # (2026-08-07, explicit instruction, may revisit), always use the
+            # FreeDV B/W preset's center/width here rather than whatever
+            # rigctl reports as passband_hz, irrespective of USB/LSB. Mode
+            # itself (which sideband to actually demodulate) still comes
+            # from hamlib as the source of truth -- only the passband shape
+            # is overridden.
+            lowcut_hz, highcut_hz = self._compute_bw_passband(mode, 'FreeDV')
+            self._pb_lowcut_hz = lowcut_hz
+            self._pb_highcut_hz = highcut_hz
+            if self._audio_stream is not None:
+                self._audio_stream.set_manual_passband(mode, lowcut_hz, highcut_hz)
 
     def _set_manual_freq(self, freq_khz, save=True):
         """Apply a new Manual-mode frequency (from Band select or drag-release)
@@ -1972,31 +1965,33 @@ class PanadapterApp:
         if self._audio_stream is not None:
             self._audio_stream.retune(freq_khz)
 
-    def _apply_manual_passband(self):
-        """(Re-)send the current Mode+B/W combo selection to the audio stream
-        -- called whenever either combo changes, and when switching into
-        Manual. No-op while stopped (no audio stream to send to).
-
-        B/W presets are stored as a positive (center, width) offset from the
-        dial frequency -- correct as-is for USB/CW, but the Kiwi expects a
+    def _compute_bw_passband(self, mode, bw_name):
+        """center/width (self._bw_hz, a positive offset+width from the dial
+        frequency) -> a properly-signed (lowcut_hz, highcut_hz) pair for the
+        given mode. Correct as-is for USB/CW, but the Kiwi expects a
         *negative* low_cut/high_cut range for LSB (its own default_passbands
         table uses e.g. usb=[300,2700] vs lsb=[-2700,-300], a mirror image --
         kiwi/client.py sends whatever sign it's given as a literal RF-offset
-        filter, it doesn't infer/flip anything from mod itself). Mirror to
-        negative here for LSB; AM's own symmetric-passband handling already
-        happens downstream in LiveAudioStream._apply_pending_retune."""
-        if self._audio_stream is None:
-            return
-        center_hz, width_hz = self._bw_hz.get(self._manual_bw, (0.0, 2400.0))
+        filter, it doesn't infer/flip anything from mod itself), and AM ends
+        up symmetric (matches LiveAudioStream's own passband negation for
+        AM, done again here just for the indicator to track it too)."""
+        center_hz, width_hz = self._bw_hz.get(bw_name, (0.0, 2400.0))
         lowcut_hz = center_hz - width_hz / 2.0
         highcut_hz = center_hz + width_hz / 2.0
-        if self._manual_mode == 'lsb':
+        mod_key = (mode or '').lower()
+        if mod_key == 'lsb':
             lowcut_hz, highcut_hz = -highcut_hz, -lowcut_hz
-        elif self._manual_mode == 'am':
-            # Matches LiveAudioStream's own symmetric-passband negation for
-            # AM -- the lowcut actually sent ends up -highcut regardless of
-            # what's passed in, so track that here too for the indicator.
+        elif mod_key == 'am':
             lowcut_hz = -highcut_hz
+        return lowcut_hz, highcut_hz
+
+    def _apply_manual_passband(self):
+        """(Re-)send the current Mode+B/W combo selection to the audio stream
+        -- called whenever either combo changes, and when switching into
+        Manual. No-op while stopped (no audio stream to send to)."""
+        if self._audio_stream is None:
+            return
+        lowcut_hz, highcut_hz = self._compute_bw_passband(self._manual_mode, self._manual_bw)
         self._pb_lowcut_hz = lowcut_hz
         self._pb_highcut_hz = highcut_hz
         self._audio_stream.set_manual_passband(self._manual_mode, lowcut_hz, highcut_hz)
