@@ -177,6 +177,23 @@ BAND_DEFAULT_MODE = {
     '10m': 'usb', '12m': 'usb', '15m': 'usb', '17m': 'usb', '20m': 'usb',
     '30m': 'usb', '40m': 'lsb', '60m': 'usb', '80m': 'lsb', '160m': 'lsb',
 }
+# Approximate amateur band edges (kHz), used only to figure out which Band
+# combo entry a given frequency falls in (see _toggle_auto_manual carrying
+# the current Auto/rigctl frequency into Manual) -- not authoritative for
+# any regulatory purpose, just wide enough to cover typical allocations.
+BAND_RANGES_KHZ = {
+    '160m': (1800.0, 2000.0), '80m': (3500.0, 4000.0), '60m': (5330.0, 5410.0),
+    '40m': (7000.0, 7300.0), '30m': (10100.0, 10150.0), '20m': (14000.0, 14350.0),
+    '17m': (18068.0, 18168.0), '15m': (21000.0, 21450.0), '12m': (24890.0, 24990.0),
+    '10m': (28000.0, 29700.0),
+}
+
+
+def band_for_freq(freq_khz):
+    for name, (lo, hi) in BAND_RANGES_KHZ.items():
+        if lo <= freq_khz <= hi:
+            return name
+    return None
 
 # B/W combo presets: each is a (center_hz, width_hz) pair defining the audio
 # demod passband -- configurable via 'bw_<name>_center_hz'/'bw_<name>_width_hz'.
@@ -1813,6 +1830,28 @@ class PanadapterApp:
             self._manual = False
             self._auto_btn_var.set('Manual')
         else:
+            # Carry the current Auto (rigctl-driven) frequency/band into
+            # Manual, rather than jumping to wherever Manual was last left --
+            # lets you flip to Manual mid-FreeDV-session to check adjacent
+            # frequencies without losing your place. No equivalent needed
+            # the other way: Auto always reflects wherever the rig currently
+            # is regardless of what Manual was just doing.
+            with self._freq_lock:
+                current_freq = self._current_freq_khz
+            if current_freq is not None:
+                self._manual_freq_khz = current_freq
+                try:
+                    save_config_value(self._options.config, 'manual_freq_khz', current_freq)
+                except Exception as e:
+                    logging.debug('failed to save manual_freq_khz: %s', e)
+                detected_band = band_for_freq(current_freq)
+                if detected_band is not None:
+                    self._manual_band = detected_band
+                    self._band_var.set(detected_band)
+                    try:
+                        save_config_value(self._options.config, 'manual_band', detected_band)
+                    except Exception as e:
+                        logging.debug('failed to save manual_band: %s', e)
             self._manual = True
             self._auto_btn_var.set('Auto')
         try:
