@@ -757,9 +757,23 @@ class LiveWFStream(KiwiSDRStream):
             self._actual_span_khz = span_for_zoom(self._zoom, max_freq_khz=self.MAX_FREQ)
             zoom_changed = True
 
-        freq_changed = pending is not None and pending != self._freq
-        if freq_changed:
-            self._freq = pending
+        freq_changed = False
+        if pending is not None and pending != self._freq:
+            # Validate before committing to self._freq -- row['center'] below
+            # re-derives from self._freq on *every* row regardless of
+            # whether a retune just happened, unguarded by any try/except.
+            # A bad rigctl-reported frequency (out of this Kiwi's tunable
+            # range -- e.g. a stray VHF value, or a unit mixup) getting
+            # stuck there would raise on every single subsequent row
+            # forever (this exact traceback, seen live 2026-08-07) instead
+            # of just failing this one retune attempt.
+            try:
+                self._remove_freq_offset(pending)
+            except Exception as e:
+                logging.warning('ignoring invalid retune to %.3f kHz: %s', pending, e)
+            else:
+                self._freq = pending
+                freq_changed = True
 
         if freq_changed or zoom_changed:
             try:
