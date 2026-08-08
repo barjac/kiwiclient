@@ -1362,6 +1362,49 @@ class SdrListDialog(tk.Toplevel):
         self._save()
 
 
+class _Tooltip:
+    """Minimal hover tooltip -- Tkinter has no built-in equivalent. text_fn
+    is called fresh each time the tooltip is shown, so it can reflect
+    whatever the widget's current state/text is at that moment rather than
+    being fixed at setup time."""
+
+    def __init__(self, widget, text_fn, delay_ms=500):
+        self._widget = widget
+        self._text_fn = text_fn
+        self._delay_ms = delay_ms
+        self._after_id = None
+        self._tip = None
+        widget.bind('<Enter>', self._on_enter, add='+')
+        widget.bind('<Leave>', self._on_leave, add='+')
+        widget.bind('<ButtonPress>', self._on_leave, add='+')
+
+    def _on_enter(self, _event):
+        self._after_id = self._widget.after(self._delay_ms, self._show)
+
+    def _on_leave(self, _event):
+        if self._after_id is not None:
+            self._widget.after_cancel(self._after_id)
+            self._after_id = None
+        self._hide()
+
+    def _show(self):
+        self._after_id = None
+        if self._tip is not None:
+            return
+        x = self._widget.winfo_rootx()
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._tip = tk.Toplevel(self._widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry('+%d+%d' % (x, y))
+        tk.Label(self._tip, text=self._text_fn(), background='#ffffe0', relief='solid',
+                 borderwidth=1, font=('TkDefaultFont', 8)).pack(ipadx=4, ipady=2)
+
+    def _hide(self):
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
 class PanadapterApp:
     def __init__(self, root, options):
         self._options = options
@@ -1528,7 +1571,9 @@ class PanadapterApp:
         ttk.Button(top, textvariable=self._stop_btn_var, command=self._toggle_stream, width=6).pack(side='left', padx=4)
 
         self._auto_btn_var = tk.StringVar(value=('Auto' if self._manual else 'Manual'))
-        ttk.Button(top, textvariable=self._auto_btn_var, command=self._toggle_auto_manual, width=7).pack(side='left', padx=4)
+        self._auto_btn = ttk.Button(top, textvariable=self._auto_btn_var, command=self._toggle_auto_manual, width=7)
+        self._auto_btn.pack(side='left', padx=4)
+        _Tooltip(self._auto_btn, lambda: 'Switch to %s' % self._auto_btn_var.get())
 
         manual_combo_state = 'readonly' if self._manual else 'disabled'
 
