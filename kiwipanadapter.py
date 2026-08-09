@@ -1514,15 +1514,6 @@ class PanadapterApp:
         # (like last_sdr) so a short trip back to Auto and forth, or a full
         # app restart, never loses them.
         self._manual = options.manual_active
-        self._manual_freq_khz = options.manual_freq_khz
-        if not is_plausible_freq_khz(self._manual_freq_khz):
-            logging.warning('manual_freq_khz %s from config is implausible, using default_freq instead',
-                             self._manual_freq_khz)
-            self._manual_freq_khz = options.default_freq
-            try:
-                save_config_value(options.config, 'manual_freq_khz', self._manual_freq_khz)
-            except Exception as e:
-                logging.debug('failed to save corrected manual_freq_khz: %s', e)
         self._manual_band = options.manual_band
         self._manual_mode = options.manual_mode
         self._manual_bw = options.manual_bw
@@ -1536,6 +1527,24 @@ class PanadapterApp:
         self._band_last_freq_khz = {name: getattr(options, 'band_%s_last_khz' % name)
                                      for name in BAND_NAMES
                                      if getattr(options, 'band_%s_last_khz' % name) is not None}
+
+        self._manual_freq_khz = options.manual_freq_khz
+        if not is_plausible_freq_khz(self._manual_freq_khz):
+            # Fall back to wherever manual_band itself says, not just a
+            # generic default_freq -- otherwise the Band combo shows one
+            # band while the actual tuned frequency silently belongs to a
+            # different one, which looks exactly like "Band is being
+            # ignored" the next time it's selected (nothing changes, since
+            # the combo already matches self._manual_band and _on_band_change
+            # treats re-selecting the current band as a no-op).
+            self._manual_freq_khz = self._band_last_freq_khz.get(
+                self._manual_band, self._band_khz.get(self._manual_band, options.default_freq))
+            logging.warning('manual_freq_khz %s from config is implausible, using %.3f kHz for band %s instead',
+                             options.manual_freq_khz, self._manual_freq_khz, self._manual_band)
+            try:
+                save_config_value(options.config, 'manual_freq_khz', self._manual_freq_khz)
+            except Exception as e:
+                logging.debug('failed to save corrected manual_freq_khz: %s', e)
         self._bw_hz = {name: (getattr(options, 'bw_%s_center_hz' % name.lower()),
                                getattr(options, 'bw_%s_width_hz' % name.lower())) for name in BW_NAMES}
         # Transient drag-to-tune state (see _on_wf_drag_*) -- not persisted.
