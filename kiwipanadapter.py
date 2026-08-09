@@ -2431,18 +2431,18 @@ class PanadapterApp:
         c.delete('all')
         w_total = max(1, c.winfo_width())
         h_total = max(1, c.winfo_height())
-        bar_h = 6
+        bar_h = 4
         bar_top = h_total - bar_h
 
         def frac_of(val):
             return max(0.0, min(1.0, (val - self._smeter_mindb) / (self._smeter_maxdb - self._smeter_mindb)))
 
-        # Peak-hold bar, drawn first/underneath in a dimmed stipple fill so it
-        # reads as a distinct layer -- only the portion beyond the current-level
-        # bar (drawn on top, below) stays visible, as a long-hang "tail".
+        # Peak-hold bar, drawn first/underneath in solid red so it reads as a
+        # distinct layer -- only the portion beyond the current-level bar
+        # (drawn on top, below) stays visible, as a long-hang "tail".
         if peak_dbm is not None:
             peak_w = int(frac_of(peak_dbm) * w_total)
-            c.create_rectangle(0, bar_top, peak_w, h_total, fill='#ff3030', width=0, stipple='gray50')
+            c.create_rectangle(0, bar_top, peak_w, h_total, fill='#ff3030', width=0)
 
         w = int(frac_of(dbm) * w_total)
         c.create_rectangle(0, bar_top, w, h_total, fill='#00ff00', width=0)
