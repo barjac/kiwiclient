@@ -276,6 +276,25 @@ for _name in BW_NAMES:
     CONFIG_SCHEMA['bw_%s_width_hz' % _name.lower()] = float
 
 
+# Generous ceiling comfortably above every real per-Kiwi MAX_FREQ seen so
+# far (30000/30720/32000 kHz) -- just enough to catch an obviously-wrong
+# frequency (a stray VHF/UHF value, a unit mixup) before it's ever committed
+# to self._current_freq_khz/self._manual_freq_khz. Either can become the
+# *initial* frequency of the next connection -- any SDR, any session, since
+# manual_freq_khz is persisted to panadapter.conf -- where a bad value
+# crashes LiveAudioStream/LiveWFStream's _setup_rx_params() immediately, on
+# every single connection attempt from then on, not just the one bad retune
+# (hit live 2026-08-09: a stray rigctl value during dummy-rig CAT testing
+# got carried into manual_freq_khz via the Auto->Manual carry-over feature,
+# persisted to disk, and broke every subsequent connection on every restart
+# until this validation was added).
+PLAUSIBLE_MAX_FREQ_KHZ = 40000.0
+
+
+def is_plausible_freq_khz(freq_khz):
+    return freq_khz is not None and 0.0 <= freq_khz <= PLAUSIBLE_MAX_FREQ_KHZ
+
+
 def zoom_for_span(span_khz, max_freq_khz=MAX_FREQ_KHZ, max_zoom=14):
     """Largest (most zoomed-in) Kiwi zoom level whose span still covers span_khz."""
     for z in range(max_zoom, -1, -1):
@@ -1496,6 +1515,14 @@ class PanadapterApp:
         # app restart, never loses them.
         self._manual = options.manual_active
         self._manual_freq_khz = options.manual_freq_khz
+        if not is_plausible_freq_khz(self._manual_freq_khz):
+            logging.warning('manual_freq_khz %s from config is implausible, using default_freq instead',
+                             self._manual_freq_khz)
+            self._manual_freq_khz = options.default_freq
+            try:
+                save_config_value(options.config, 'manual_freq_khz', self._manual_freq_khz)
+            except Exception as e:
+                logging.debug('failed to save corrected manual_freq_khz: %s', e)
         self._manual_band = options.manual_band
         self._manual_mode = options.manual_mode
         self._manual_bw = options.manual_bw
@@ -1899,6 +1926,10 @@ class PanadapterApp:
             # is regardless of what Manual was just doing.
             with self._freq_lock:
                 current_freq = self._current_freq_khz
+            if not is_plausible_freq_khz(current_freq):
+                if current_freq is not None:
+                    logging.warning('not carrying implausible Auto frequency %.3f kHz into Manual', current_freq)
+                current_freq = None
             if current_freq is not None:
                 self._manual_freq_khz = current_freq
                 try:
@@ -2019,6 +2050,9 @@ class PanadapterApp:
     def _on_rigctl_freq(self, freq_khz):
         if self._manual:
             return   # Manual owns the frequency -- ignore FreeDV/rigctl until switched back to Auto
+        if not is_plausible_freq_khz(freq_khz):
+            logging.warning('ignoring implausible rigctl frequency %.3f kHz', freq_khz)
+            return
         with self._freq_lock:
             changed = self._current_freq_khz != freq_khz
             self._current_freq_khz = freq_khz
@@ -2052,6 +2086,9 @@ class PanadapterApp:
         via the same retune path _on_rigctl_freq uses for Auto -- live-applies
         only if a stream currently exists (no-op while stopped, matching
         _on_sdr_change's "just remember it" precedent)."""
+        if not is_plausible_freq_khz(freq_khz):
+            logging.warning('ignoring implausible manual frequency %.3f kHz', freq_khz)
+            return
         self._manual_freq_khz = freq_khz
         if save:
             try:
