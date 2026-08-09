@@ -1940,19 +1940,29 @@ class PanadapterApp:
                     logging.warning('not carrying implausible Auto frequency %.3f kHz into Manual', current_freq)
                 current_freq = None
             if current_freq is not None:
-                self._manual_freq_khz = current_freq
-                try:
-                    save_config_value(self._options.config, 'manual_freq_khz', current_freq)
-                except Exception as e:
-                    logging.debug('failed to save manual_freq_khz: %s', e)
                 detected_band = band_for_freq(current_freq)
-                if detected_band is not None:
+                if detected_band is not None and detected_band != self._manual_band:
+                    # Save the band we're leaving its own last-used frequency
+                    # first, same as _on_band_change does -- otherwise its
+                    # old self._manual_freq_khz value is simply lost/overwritten
+                    # below rather than remembered for a return visit.
+                    self._band_last_freq_khz[self._manual_band] = self._manual_freq_khz
+                    try:
+                        save_config_value(self._options.config,
+                                           'band_%s_last_khz' % self._manual_band, self._manual_freq_khz)
+                    except Exception as e:
+                        logging.debug('failed to save band_%s_last_khz: %s', self._manual_band, e)
                     self._manual_band = detected_band
                     self._band_var.set(detected_band)
                     try:
                         save_config_value(self._options.config, 'manual_band', detected_band)
                     except Exception as e:
                         logging.debug('failed to save manual_band: %s', e)
+                self._manual_freq_khz = current_freq
+                try:
+                    save_config_value(self._options.config, 'manual_freq_khz', current_freq)
+                except Exception as e:
+                    logging.debug('failed to save manual_freq_khz: %s', e)
             self._manual = True
             self._auto_btn_var.set('Auto')
         try:
