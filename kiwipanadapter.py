@@ -1980,9 +1980,26 @@ class PanadapterApp:
         name = self._band_var.get()
         if name == self._manual_band:
             return   # re-selecting the already-active band -- nothing to do
-        freq_khz = self._band_last_freq_khz.get(name, self._band_khz.get(name))
+        last_khz = self._band_last_freq_khz.get(name)
+        if last_khz is not None and band_for_freq(last_khz) != name:
+            # Self-heal a stale/corrupted "last" entry -- e.g. one saved
+            # under the wrong band's key by the drag-out-of-range bug above,
+            # before that was fixed -- rather than trusting it forever.
+            logging.warning('band_%s_last_khz (%.3f kHz) does not actually belong to %s, ignoring it', name, last_khz, name)
+            del self._band_last_freq_khz[name]
+            last_khz = None
+        freq_khz = last_khz if last_khz is not None else self._band_khz.get(name)
         if freq_khz is None:
             return
+        if last_khz is None and freq_khz is not None:
+            # Replace the corrected value in the file too (if we just healed
+            # a bad entry above), so it doesn't keep reappearing every
+            # restart -- band_<name>_last_khz always ends up either a real
+            # remembered frequency or this band's own preset, never stale.
+            try:
+                save_config_value(self._options.config, 'band_%s_last_khz' % name, freq_khz)
+            except Exception as e:
+                logging.debug('failed to save band_%s_last_khz: %s', name, e)
 
         # Remember exactly where we're leaving this band, for a same-session
         # (and, since it's saved to config too, a later-session) return.
@@ -2431,6 +2448,21 @@ class PanadapterApp:
                 # genuine new start/stop.
                 self._last_start = final_freq - span / 2
                 self._last_stop = final_freq + span / 2
+            # Dragging can easily land well outside self._manual_band's own
+            # range (e.g. at a wide Span) -- keep Band in sync with reality
+            # rather than letting it silently drift stale, which would then
+            # get persisted as if the new frequency belonged to the old band
+            # (hit live 2026-08-09: a drag on 40m at 250kHz span landed in
+            # 20m territory, got saved as band_40m_last_khz, and the next
+            # startup showed Band=40m while actually tuned to a 20m frequency).
+            detected_band = band_for_freq(final_freq)
+            if detected_band is not None and detected_band != self._manual_band:
+                self._manual_band = detected_band
+                self._band_var.set(detected_band)
+                try:
+                    save_config_value(self._options.config, 'manual_band', detected_band)
+                except Exception as e:
+                    logging.debug('failed to save manual_band: %s', e)
             self._set_manual_freq(final_freq)
         self._canvas.coords(self._image_id, 0, 0)
         self._redraw()
