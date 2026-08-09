@@ -1545,6 +1545,23 @@ class PanadapterApp:
                 save_config_value(options.config, 'manual_freq_khz', self._manual_freq_khz)
             except Exception as e:
                 logging.debug('failed to save corrected manual_freq_khz: %s', e)
+        else:
+            # manual_freq_khz is itself a perfectly plausible frequency, but
+            # may still not actually belong to manual_band (e.g. stale cruft
+            # from before this consistency checking existed) -- the
+            # _on_band_change/drag self-heals only fire on a later live
+            # action, so a straight restart would otherwise keep showing the
+            # stale band forever. Trust the frequency as ground truth here
+            # and correct the band label to match it, not the other way round.
+            actual_band = band_for_freq(self._manual_freq_khz)
+            if actual_band is not None and actual_band != self._manual_band:
+                logging.warning('manual_band %s from config does not match manual_freq_khz %.3f kHz -- correcting to %s',
+                                 self._manual_band, self._manual_freq_khz, actual_band)
+                self._manual_band = actual_band
+                try:
+                    save_config_value(options.config, 'manual_band', actual_band)
+                except Exception as e:
+                    logging.debug('failed to save corrected manual_band: %s', e)
         self._bw_hz = {name: (getattr(options, 'bw_%s_center_hz' % name.lower()),
                                getattr(options, 'bw_%s_width_hz' % name.lower())) for name in BW_NAMES}
         # Transient drag-to-tune state (see _on_wf_drag_*) -- not persisted.
