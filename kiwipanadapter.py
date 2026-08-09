@@ -1548,10 +1548,27 @@ class PanadapterApp:
             geometry += '+%d+%d' % (self._options.window_x, self._options.window_y)
         self._root.geometry(geometry)
 
-        # Fixed-height widgets (top bar, S-meter bar) must be packed to their
-        # side *before* the expanding waterfall canvas, otherwise Tk's pack
-        # geometry manager starves them of space first as the window shrinks
-        # instead of shrinking only the expandable canvas.
+        # Fixed-height widgets (S-meter bar, top control bar, freq-axis bar)
+        # must be packed to their side *before* the expanding waterfall
+        # canvas, otherwise Tk's pack geometry manager starves them of space
+        # first as the window shrinks instead of shrinking only the
+        # expandable canvas.
+        #
+        # S-meter sits above the control bar (not below the waterfall, its
+        # original position) and matches the freq-axis bar's height, so that
+        # if the window's bottom ends up slid down behind a system panel on
+        # a short screen, it's the waterfall's own bottom edge that gets
+        # clipped, not the S-meter reading.
+        meter = ttk.Frame(self._root)
+        meter.pack(side='top', fill='x', padx=4, pady=(4, 2))
+        ttk.Label(meter, text='S:').pack(side='left')
+        self._dbm_var = tk.StringVar(value='-- dBm')
+        # Fixed width so the S-meter canvas next to it (fill='x', expand=True)
+        # doesn't resize when the dBm text's digit count changes (e.g. -99 -> -100).
+        ttk.Label(meter, textvariable=self._dbm_var, width=8, anchor='e').pack(side='right', padx=8)
+        self._smeter_canvas = tk.Canvas(meter, height=20, highlightthickness=0, bg='black')
+        self._smeter_canvas.pack(side='left', fill='x', expand=True, padx=4)
+
         top = ttk.Frame(self._root)
         top.pack(side='top', fill='x', padx=4, pady=4)
 
@@ -1623,20 +1640,6 @@ class PanadapterApp:
                                        width=7, values=BW_NAMES)
         self._bw_combo.pack(side='left', padx=(2, 4))
         self._bw_combo.bind('<<ComboboxSelected>>', self._on_bw_change)
-
-        # Fixed-height widgets must be packed to their side *before* the
-        # expanding waterfall canvas, otherwise Tk's pack geometry manager
-        # starves them of space first as the window shrinks instead of
-        # shrinking only the expandable canvas.
-        meter = ttk.Frame(self._root)
-        meter.pack(side='bottom', fill='x', padx=4, pady=(2, 4))
-        ttk.Label(meter, text='S:').pack(side='left')
-        self._dbm_var = tk.StringVar(value='-- dBm')
-        # Fixed width so the S-meter canvas next to it (fill='x', expand=True)
-        # doesn't resize when the dBm text's digit count changes (e.g. -99 -> -100).
-        ttk.Label(meter, textvariable=self._dbm_var, width=8, anchor='e').pack(side='right', padx=8)
-        self._smeter_canvas = tk.Canvas(meter, height=28, highlightthickness=0, bg='black')
-        self._smeter_canvas.pack(side='left', fill='x', expand=True, padx=4)
 
         self._freqaxis_canvas = tk.Canvas(self._root, height=20, highlightthickness=0, bg='black')
         self._freqaxis_canvas.pack(side='top', fill='x')
