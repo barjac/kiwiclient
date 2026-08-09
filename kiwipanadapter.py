@@ -1606,7 +1606,17 @@ class PanadapterApp:
         # canvas, otherwise Tk's pack geometry manager starves them of space
         # first as the window shrinks instead of shrinking only the
         # expandable canvas.
-        top = ttk.Frame(self._root)
+        # Mid-grey background on the control bar itself, so the buttons and
+        # combos (left at the theme's own default appearance) visually stand
+        # out against it -- ttk widgets don't take a plain bg= like classic
+        # tk ones, so this needs a named style applied to the frame and its
+        # plain (non-button/combo) Label children, or the labels would keep
+        # showing the old theme background as a mismatched box around them.
+        style = ttk.Style(self._root)
+        style.configure('Control.TFrame', background='#808080')
+        style.configure('Control.TLabel', background='#808080')
+
+        top = ttk.Frame(self._root, style='Control.TFrame')
         top.pack(side='top', fill='x', padx=4, pady=4)
 
         # Packed first (side='right') so it claims its space before any of
@@ -1616,9 +1626,10 @@ class PanadapterApp:
         # squeezing the left-side controls, which is the much less
         # important side to lose room to.
         self._freq_var = tk.StringVar(value='-- kHz')
-        ttk.Label(top, textvariable=self._freq_var, font=('TkFixedFont', 11, 'bold')).pack(side='right')
+        ttk.Label(top, textvariable=self._freq_var, font=('TkFixedFont', 11, 'bold'),
+                  style='Control.TLabel').pack(side='right')
 
-        ttk.Label(top, text='SDR:').pack(side='left')
+        ttk.Label(top, text='SDR:', style='Control.TLabel').pack(side='left')
         self._sdr_var = tk.StringVar(value=self._initial_sdr['name'])
         combo_width = max((len(s['name']) for s in self._sdr_list), default=10) + 2
         self._sdr_combo = ttk.Combobox(top, textvariable=self._sdr_var, state='readonly',
@@ -1631,7 +1642,7 @@ class PanadapterApp:
         # Fixed width (like the S-meter's dBm label below) so "connecting to
         # <name>..."/"connected"/"stopped" text changes don't shift Manage/
         # Stop/Auto/the combos left and right as the status changes.
-        ttk.Label(top, textvariable=self._status_var, width=21, anchor='w').pack(side='left', padx=8)
+        ttk.Label(top, textvariable=self._status_var, width=21, anchor='w', style='Control.TLabel').pack(side='left', padx=8)
 
         ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left')
 
@@ -1645,7 +1656,7 @@ class PanadapterApp:
 
         manual_combo_state = 'readonly' if self._manual else 'disabled'
 
-        ttk.Label(top, text='Span:').pack(side='left')
+        ttk.Label(top, text='Span:', style='Control.TLabel').pack(side='left')
         self._zoom_labels = [self._fmt_zoom_label(k) for k in self._zoom_steps_khz]
         self._zoom_label_khz = dict(zip(self._zoom_labels, self._zoom_steps_khz))
         self._zoom_var = tk.StringVar(value=self._fmt_zoom_label(self._zoom_span_khz))
@@ -1657,21 +1668,21 @@ class PanadapterApp:
         self._zoom_combo.pack(side='left', padx=(2, 4))
         self._zoom_combo.bind('<<ComboboxSelected>>', self._on_zoom_change)
 
-        ttk.Label(top, text='Band:').pack(side='left')
+        ttk.Label(top, text='Band:', style='Control.TLabel').pack(side='left')
         self._band_var = tk.StringVar(value=self._manual_band)
         self._band_combo = ttk.Combobox(top, textvariable=self._band_var, state=manual_combo_state,
                                          width=5, values=BAND_NAMES)
         self._band_combo.pack(side='left', padx=(2, 4))
         self._band_combo.bind('<<ComboboxSelected>>', self._on_band_change)
 
-        ttk.Label(top, text='Mode:').pack(side='left')
+        ttk.Label(top, text='Mode:', style='Control.TLabel').pack(side='left')
         self._mode_var = tk.StringVar(value=self._manual_mode.upper())
         self._mode_combo = ttk.Combobox(top, textvariable=self._mode_var, state=manual_combo_state,
                                          width=5, values=MODE_NAMES)
         self._mode_combo.pack(side='left', padx=(2, 4))
         self._mode_combo.bind('<<ComboboxSelected>>', self._on_mode_change)
 
-        ttk.Label(top, text='B/W:').pack(side='left')
+        ttk.Label(top, text='B/W:', style='Control.TLabel').pack(side='left')
         self._bw_var = tk.StringVar(value=self._manual_bw)
         self._bw_combo = ttk.Combobox(top, textvariable=self._bw_var, state=manual_combo_state,
                                        width=7, values=BW_NAMES)
