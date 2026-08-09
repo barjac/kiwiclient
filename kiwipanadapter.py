@@ -1613,8 +1613,8 @@ class PanadapterApp:
         # plain (non-button/combo) Label children, or the labels would keep
         # showing the old theme background as a mismatched box around them.
         style = ttk.Style(self._root)
-        style.configure('Control.TFrame', background='#808080')
-        style.configure('Control.TLabel', background='#808080')
+        style.configure('Control.TFrame', background='#c0c0c0')
+        style.configure('Control.TLabel', background='#c0c0c0')
 
         top = ttk.Frame(self._root, style='Control.TFrame')
         top.pack(side='top', fill='x', padx=4, pady=4)
