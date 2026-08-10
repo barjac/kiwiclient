@@ -22,6 +22,7 @@ import os
 import queue
 import re
 import socket
+import subprocess
 import threading
 import time
 from queue import Queue, Empty
@@ -246,6 +247,8 @@ CONFIG_SCHEMA = {
     'last_sdr': str,
     'modulation': str,
     'sounddevice': str,
+    'radio_capture_device': str,
+    'rx_source_mode': str,
     'ncomp': parse_bool,
     'lp_cut': float,
     'hp_cut': float,
@@ -527,6 +530,74 @@ def save_config_value(path, key, value):
         lines.append(new_line)
     with open(path, 'w') as f:
         f.writelines(lines)
+
+
+def _pw_link_list():
+    """Snapshot of the current PipeWire graph's links as {dest_port: {src_ports}},
+    parsed from 'pw-link -l' (same '<port>' / '  |<- <src>' / '  |-> <dst>'
+    format freedv-start-leno's own pw-link-ls/pw-link-del awk functions
+    parse). Only the '|<-' half is kept (each link appears twice, once from
+    each endpoint's perspective) so callers can check current state before
+    connecting/disconnecting. Returns {} on any pw-link failure."""
+    try:
+        out = subprocess.run(['pw-link', '-l'], capture_output=True, text=True, timeout=2).stdout
+    except Exception as e:
+        logging.warning('pw-link -l failed: %s', e)
+        return {}
+    links = {}
+    prev = None
+    for line in out.splitlines():
+        if line.startswith((' ', '\t')):
+            arrow = line.strip()
+            if arrow.startswith('|<-') and prev:
+                links.setdefault(prev, set()).add(arrow[3:].strip())
+        else:
+            prev = line.strip()
+    return links
+
+
+def _pw_node_ports(node, direction):
+    """'node:port' strings for the given node ('o' = pw-link -o, its output/
+    source ports; 'i' = pw-link -i, its input/sink ports), sorted so FL comes
+    before FR. Returns [] if the node isn't currently in the PipeWire graph
+    (not running, wrong name, hardware unplugged) or pw-link fails."""
+    try:
+        out = subprocess.run(['pw-link', '-o' if direction == 'o' else '-i'],
+                              capture_output=True, text=True, timeout=2).stdout
+    except Exception as e:
+        logging.warning('pw-link -%s failed: %s', direction, e)
+        return []
+    prefix = node + ':'
+    return sorted(p for p in out.splitlines() if p.startswith(prefix))
+
+
+def _pw_link_set(src_ports, dst_ports, connect):
+    """Idempotently connect/disconnect src_ports<->dst_ports (paired
+    positionally; a single-port src is paired with every dst port). Skips
+    pairs already in the desired state, so repeat calls are silent no-ops.
+    Returns False if either side is empty or any pw-link call failed."""
+    if not src_ports or not dst_ports:
+        return False
+    if len(src_ports) == 1 < len(dst_ports):
+        pairs = [(src_ports[0], d) for d in dst_ports]
+    else:
+        pairs = list(zip(src_ports, dst_ports))
+    current = _pw_link_list()
+    ok = True
+    for s, d in pairs:
+        linked = s in current.get(d, ())
+        if connect == linked:
+            continue
+        cmd = ['pw-link'] + (['-d'] if not connect else []) + [s, d]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            if r.returncode != 0:
+                logging.warning('%s failed: %s', ' '.join(cmd), r.stderr.strip())
+                ok = False
+        except Exception as e:
+            logging.warning('%s raised %s', ' '.join(cmd), e)
+            ok = False
+    return ok
 
 
 def _parse_sdr_tokens(parts):
@@ -1513,6 +1584,10 @@ class PanadapterApp:
         # remembered manual_* values persist to config immediately on change
         # (like last_sdr) so a short trip back to Auto and forth, or a full
         # app restart, never loses them.
+        # Which source feeds FreeDV's FDV_RX_in sink: 'RX' (real rig, via
+        # options.radio_capture_device) or 'SDR' (this panadapter's own
+        # audio, via FDV_PAN). Audio-only -- unrelated to _manual above.
+        self._rx_source = options.rx_source_mode
         self._manual = options.manual_active
         self._manual_band = options.manual_band
         self._manual_mode = options.manual_mode
@@ -1582,6 +1657,26 @@ class PanadapterApp:
 
         root.title('Kiwi Panadapter')
         self._build_ui()
+
+        # Apply the persisted RX/SDR source to the live PipeWire graph --
+        # nothing else in this system ever links FDV_PAN/radio_capture_device
+        # into FDV_RX_in (freedv-links has no such entry, and
+        # freedv-start-leno's restore_links step runs before this app even
+        # starts), so this is the only place it happens. Self-heal to SDR
+        # (always available, since it's just this app's own audio) if RX was
+        # persisted but the radio device isn't actually present -- keeps a
+        # no-radio machine's copy of the config starting in a working state.
+        if not self._apply_rx_source(self._rx_source):
+            logging.warning('radio_capture_device unavailable at startup -- falling back to SDR RX source')
+            self._rx_source = 'SDR'
+            self._apply_rx_source('SDR')
+            self._rx_source_var.set('SDR')
+            self._rx_source_btn.configure(style='Amber.TButton')
+            try:
+                save_config_value(self._options.config, 'rx_source_mode', 'SDR')
+            except Exception as e:
+                logging.debug('failed to save rx_source_mode: %s', e)
+
         root.update_idletasks()   # so winfo_width/height are accurate before the first row arrives
 
         self._rigctl_poller = RigctlPoller(options.rigctl_host, options.rigctl_port,
@@ -1615,6 +1710,13 @@ class PanadapterApp:
         style = ttk.Style(self._root)
         style.configure('Control.TFrame', background='#dce9f5')
         style.configure('Control.TLabel', background='#dce9f5')
+        # RX/SDR source toggle: green while FreeDV listens to the real
+        # radio, amber while it's listening to this panadapter instead --
+        # amber as the "not the radio, don't forget" color.
+        style.configure('Green.TButton', background='#4caf50')
+        style.map('Green.TButton', background=[('active', '#66bb6a'), ('disabled', '#a5d6a7')])
+        style.configure('Amber.TButton', background='#ffb300')
+        style.map('Amber.TButton', background=[('active', '#ffc107'), ('disabled', '#ffe082')])
 
         top = ttk.Frame(self._root, style='Control.TFrame')
         top.pack(side='top', fill='x', padx=4, pady=4)
@@ -1653,6 +1755,14 @@ class PanadapterApp:
         self._auto_btn = ttk.Button(top, textvariable=self._auto_btn_var, command=self._toggle_auto_manual, width=7)
         self._auto_btn.pack(side='left', padx=4)
         _Tooltip(self._auto_btn, lambda: 'Switch to %s' % self._auto_btn_var.get())
+
+        self._rx_source_var = tk.StringVar(value=self._rx_source)
+        self._rx_source_btn = ttk.Button(top, textvariable=self._rx_source_var, command=self._toggle_rx_source,
+                                          width=4,
+                                          style=('Green.TButton' if self._rx_source == 'RX' else 'Amber.TButton'))
+        self._rx_source_btn.pack(side='left', padx=4)
+        _Tooltip(self._rx_source_btn, lambda: 'FreeDV RX audio: %s (click for %s)' % (
+            self._rx_source_var.get(), 'SDR' if self._rx_source_var.get() == 'RX' else 'RX'))
 
         manual_combo_state = 'readonly' if self._manual else 'disabled'
 
@@ -1742,6 +1852,34 @@ class PanadapterApp:
         self._audio_worker = KiwiWorker(args=(self._audio_stream, audio_opt, True, False,
                                                self._audio_run_event, audio_camp_wait_event))
         self._audio_worker.start()
+
+    def _apply_rx_source(self, mode):
+        """mode: 'RX' or 'SDR'. Idempotently repoints FDV_RX_in's playback
+        ports at either the configured radio_capture_device ('RX') or
+        FDV_PAN's monitor -- this panadapter's own audio ('SDR'), and
+        disconnects the other. Doesn't touch rigctl/frequency routing at
+        all. Returns False (logging a warning, changing nothing) if 'RX' was
+        requested but radio_capture_device is unset or not currently present
+        in the PipeWire graph."""
+        rx_in = _pw_node_ports('FDV_RX_in', 'i')
+        pan = _pw_node_ports('FDV_PAN', 'o')
+        radio_dev = self._options.radio_capture_device
+        radio = _pw_node_ports(radio_dev, 'o') if radio_dev else []
+        if mode == 'RX':
+            if not radio_dev:
+                logging.warning('rx_source_mode RX requested but radio_capture_device is not configured')
+                return False
+            if not radio:
+                logging.warning('radio_capture_device "%s" not found in the PipeWire graph', radio_dev)
+                return False
+            _pw_link_set(radio, rx_in, connect=True)
+            _pw_link_set(pan, rx_in, connect=False)
+            return True
+        else:
+            _pw_link_set(pan, rx_in, connect=True)
+            if radio:
+                _pw_link_set(radio, rx_in, connect=False)
+            return True
 
     def _start_stream(self, sdr_entry):
         with self._freq_lock:
@@ -1949,6 +2087,21 @@ class PanadapterApp:
         self._band_combo.config(state=state)
         self._mode_combo.config(state=state)
         self._bw_combo.config(state=state)
+
+    def _toggle_rx_source(self):
+        new_mode = 'SDR' if self._rx_source == 'RX' else 'RX'
+        if not self._apply_rx_source(new_mode):
+            # Graceful failure (no radio_capture_device configured/present):
+            # _apply_rx_source already logged why. State/config/PipeWire
+            # links are left exactly as they were -- nothing to undo here.
+            return
+        self._rx_source = new_mode
+        self._rx_source_var.set(new_mode)
+        self._rx_source_btn.configure(style=('Green.TButton' if new_mode == 'RX' else 'Amber.TButton'))
+        try:
+            save_config_value(self._options.config, 'rx_source_mode', new_mode)
+        except Exception as e:
+            logging.debug('failed to save rx_source_mode: %s', e)
 
     def _toggle_auto_manual(self):
         if self._manual:
@@ -2639,6 +2792,14 @@ def parse_args():
                          'list available devices (config: sounddevice)')
     p.add_argument('--ls-snd', '--list-sound-devices', dest='list_sound_devices', action='store_true',
                     default=False, help='list available sound devices and exit')
+    p.add_argument('--radio-capture-device', dest='radio_capture_device',
+                    default=cfg.get('radio_capture_device', ''),
+                    help='PipeWire capture node name for a real rig\'s RX audio, used by the RX/SDR toggle '
+                         '-- empty means no radio configured (config: radio_capture_device)')
+    p.add_argument('--rx-source-mode', dest='rx_source_mode', choices=['RX', 'SDR'],
+                    default=cfg.get('rx_source_mode', 'RX'),
+                    help='initial FreeDV RX audio source -- RX (real radio) or SDR (this panadapter) '
+                         '(config: rx_source_mode, default RX)')
     p.add_argument('--ncomp', '--no-compression', dest='ncomp', action='store_true',
                     default=cfg.get('ncomp', False),
                     help="don't use audio compression -- better quality for a data-mode decoder like FreeDV, "
