@@ -1664,7 +1664,7 @@ class PanadapterApp:
             self._zoom_labels = [self._zoom_var.get()] + self._zoom_labels
             self._zoom_label_khz[self._zoom_var.get()] = self._zoom_span_khz
         self._zoom_combo = ttk.Combobox(top, textvariable=self._zoom_var, state='readonly',
-                                         width=9, values=self._zoom_labels)
+                                         width=7, values=self._zoom_labels)
         self._zoom_combo.pack(side='left', padx=(2, 4))
         self._zoom_combo.bind('<<ComboboxSelected>>', self._on_zoom_change)
 
@@ -1942,7 +1942,7 @@ class PanadapterApp:
         # resolves to the same zoom level either way -- see zoom_for_span/
         # span_for_zoom), this only fixes the displayed text.
         actual_khz = span_for_zoom(zoom_for_span(nominal_khz))
-        return ('%.1f kHz' % actual_khz)
+        return ('%d kHz' % round(actual_khz))
 
     def _set_manual_combo_states(self, manual):
         state = 'readonly' if manual else 'disabled'
