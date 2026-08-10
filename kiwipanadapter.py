@@ -1864,7 +1864,14 @@ class PanadapterApp:
         rx_in = _pw_node_ports('FDV_RX_in', 'i')
         pan = _pw_node_ports('FDV_PAN', 'o')
         radio_dev = self._options.radio_capture_device
-        radio = _pw_node_ports(radio_dev, 'o') if radio_dev else []
+        # _pw_node_ports() matches on the bare node name and appends ':'
+        # itself -- strip any port suffix (e.g. a "node:port" string copied
+        # straight out of 'pw-link -o' output, which is how this value is
+        # documented/likely to be filled in) so the match doesn't silently
+        # fail against a name that's technically correct but has an extra
+        # ":port" tacked on.
+        radio_node = radio_dev.split(':', 1)[0] if radio_dev else radio_dev
+        radio = _pw_node_ports(radio_node, 'o') if radio_node else []
         if mode == 'RX':
             if not radio_dev:
                 logging.warning('rx_source_mode RX requested but radio_capture_device is not configured')
