@@ -56,6 +56,53 @@ RECONNECT_HEALTHY_RESET_SEC = 3.0  # a stream up this long counts as recovered -
                                     # (some Kiwis/proxies cleanly kick a mimic_browser connection every ~10s
                                     # regardless; without this, that alone exhausts MAX_RECONNECT_RETRIES and
                                     # the app gives up for good even though every individual reconnect works)
+THEME_POLL_MS = 5000  # how often to re-check the desktop's light/dark setting
+
+# Control-bar tint per theme -- ttk Frame/Label don't inherit the desktop
+# theme's own background/text colors like the Buttons/Comboboxes left at
+# their default appearance do, so these need to be picked explicitly and
+# re-applied if the desktop theme changes while running.
+CONTROL_BAR_COLORS = {
+    'light': {'bg': '#dce9f5', 'fg': '#000000'},
+    'dark':  {'bg': '#2b3a4a', 'fg': '#e8e8e8'},
+}
+
+
+def _detect_dark_theme():
+    """Best-effort light/dark detection for the desktop color scheme.
+    KDE Plasma/Breeze first, falling back to GTK/GNOME's gsettings.
+    Defaults to light (False) if nothing can be read.
+
+    KDE's ColorScheme/LookAndFeelPackage keys can live in either
+    ~/.config/kdeglobals (session overrides) or ~/.config/kdedefaults/
+    kdeglobals (distro-set defaults, used as-is when the user never
+    overrode them) -- e.g. a stock Breeze Dark session was observed here
+    with only 'LookAndFeelPackage=org.kde.breezedark.desktop' in the first
+    file and the actual 'ColorScheme=BreezeDark' in the second, so both
+    need checking and neither alone is reliable."""
+    hint_found = False
+    for path in (os.path.expanduser('~/.config/kdeglobals'),
+                 os.path.expanduser('~/.config/kdedefaults/kdeglobals')):
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('ColorScheme=') or line.startswith('LookAndFeelPackage='):
+                        hint_found = True
+                        if 'dark' in line.lower():
+                            return True
+        except OSError:
+            continue
+    if hint_found:
+        return False
+    try:
+        out = subprocess.run(['gsettings', 'get', 'org.gnome.desktop.interface', 'color-scheme'],
+                              capture_output=True, text=True, timeout=1)
+        if out.returncode == 0:
+            return 'dark' in out.stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
 
 # Real headers/URL path captured from an actual Firefox 140 connecting to a
 # KiwiSDR (packet capture, 2026-07-30) -- some Kiwis (confirmed: a genuine
@@ -1701,15 +1748,26 @@ class PanadapterApp:
         # canvas, otherwise Tk's pack geometry manager starves them of space
         # first as the window shrinks instead of shrinking only the
         # expandable canvas.
-        # Mid-grey background on the control bar itself, so the buttons and
+        # Tinted background on the control bar itself, so the buttons and
         # combos (left at the theme's own default appearance) visually stand
         # out against it -- ttk widgets don't take a plain bg= like classic
         # tk ones, so this needs a named style applied to the frame and its
         # plain (non-button/combo) Label children, or the labels would keep
         # showing the old theme background as a mismatched box around them.
-        style = ttk.Style(self._root)
-        style.configure('Control.TFrame', background='#dce9f5')
-        style.configure('Control.TLabel', background='#dce9f5')
+        # The tint itself tracks the desktop's light/dark setting (see
+        # _apply_control_bar_theme) rather than being fixed, so it stays
+        # readable under a dark Breeze theme too.
+        self._style = ttk.Style(self._root)
+        style = self._style
+        # Flat, like the other control-bar labels (a sunken/bordered box was
+        # tried and looked cluttered in the tight bar). Kept pinned to a
+        # fixed light background rather than tracking the dark-mode tint --
+        # the Buttons/Comboboxes beside it stay at Tk's native (light) look
+        # regardless of the desktop theme, so a dark status box just clashed
+        # with them instead of reading as "matching the theme".
+        style.configure('Status.TLabel', padding=(4, 1), background='#dce9f5', foreground='#000000')
+        self._theme_dark = None
+        self._apply_control_bar_theme()
         # RX/SDR source toggle: green while FreeDV listens to the real
         # radio, amber while it's listening to this panadapter instead --
         # amber as the "not the radio, don't forget" color.
@@ -1740,27 +1798,30 @@ class PanadapterApp:
         self._sdr_combo.pack(side='left', padx=4)
         self._sdr_combo.bind('<<ComboboxSelected>>', self._on_sdr_change)
 
-        self._status_var = tk.StringVar(value='connecting...')
-        # Fixed width (like the S-meter's dBm label below) so "connecting to
-        # <name>..."/"connected"/"stopped" text changes don't shift Manage/
+        self._status_var = tk.StringVar(value='Connecting')
+        # Fixed width (like the S-meter's dBm label below) so
+        # Connecting/Disconnecting/Connected/Stopped text changes don't shift Manage/
         # Stop/Auto/the combos left and right as the status changes.
-        ttk.Label(top, textvariable=self._status_var, width=21, anchor='w', style='Control.TLabel').pack(side='left', padx=8)
+        ttk.Label(top, textvariable=self._status_var, width=21, anchor='w', style='Status.TLabel').pack(side='left', padx=2)
 
-        ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left')
+        ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left', padx=2)
 
         self._stop_btn_var = tk.StringVar(value='Stop')
-        ttk.Button(top, textvariable=self._stop_btn_var, command=self._toggle_stream, width=6).pack(side='left', padx=4)
+        ttk.Button(top, textvariable=self._stop_btn_var, command=self._toggle_stream, width=6).pack(side='left', padx=2)
 
-        self._auto_btn_var = tk.StringVar(value=('Auto' if self._manual else 'Manual'))
+        # Shows the current state (Auto/Manual), not the click target -- a
+        # tooltip spells out the action since the label alone no longer does.
+        self._auto_btn_var = tk.StringVar(value=('Manual' if self._manual else 'Auto'))
         self._auto_btn = ttk.Button(top, textvariable=self._auto_btn_var, command=self._toggle_auto_manual, width=7)
-        self._auto_btn.pack(side='left', padx=4)
-        _Tooltip(self._auto_btn, lambda: 'Switch to %s' % self._auto_btn_var.get())
+        self._auto_btn.pack(side='left', padx=2)
+        _Tooltip(self._auto_btn, lambda: 'Click to switch to %s' % (
+            'Auto' if self._auto_btn_var.get() == 'Manual' else 'Manual'))
 
         self._rx_source_var = tk.StringVar(value=self._rx_source)
         self._rx_source_btn = ttk.Button(top, textvariable=self._rx_source_var, command=self._toggle_rx_source,
                                           width=4,
                                           style=('Green.TButton' if self._rx_source == 'RX' else 'Amber.TButton'))
-        self._rx_source_btn.pack(side='left', padx=4)
+        self._rx_source_btn.pack(side='left', padx=2)
         _Tooltip(self._rx_source_btn, lambda: 'FreeDV RX audio: %s (click for %s)' % (
             self._rx_source_var.get(), 'SDR' if self._rx_source_var.get() == 'RX' else 'RX'))
 
@@ -1924,7 +1985,7 @@ class PanadapterApp:
             self._start_wf_connection(sdr_entry, freq, mimic_browser)
             self._start_audio_connection(sdr_entry, freq, mimic_browser)
 
-        self._status_var.set('connecting to %s...' % sdr_entry['name'])
+        self._status_var.set('Connecting')
         self._stream_start_ts = time.time()
         if self._manual:
             # A freshly (re)created LiveAudioStream always starts with the
@@ -2047,11 +2108,49 @@ class PanadapterApp:
             logging.debug('failed to save last_sdr: %s', e)
         if self._stopped:
             return   # just remember the selection -- Start will connect to it
+        # The combobox already shows the newly-picked name the instant it's
+        # selected (that's just how Combobox works) -- hold the display back
+        # on the still-active SDR while actually disconnecting from it, and
+        # only swap to the new name once we really start connecting to it,
+        # so the box always reflects what's actually live, not what's queued.
+        if self._active_sdr is not None:
+            self._sdr_var.set(self._active_sdr['name'])
+        # Selecting the dropdown item leaves the Combobox's whole displayed
+        # text highlighted (Entry-internal selection state, independent of
+        # the textvariable) -- reassigning the variable above doesn't clear
+        # it, so the stale selection range then lands over only part of
+        # whatever text is showing next, painting a spurious highlighted
+        # band. Clear it explicitly every time this changes programmatically.
+        self._sdr_combo.selection_clear()
+        # _stop_stream() blocks on up to two thread joins (2s each) -- paint
+        # this now, before that blocks the mainloop, so the click doesn't
+        # look like it did nothing for a couple of seconds. update_idletasks()
+        # alone wasn't enough to force the actual repaint out to the display
+        # before the blocking joins below ran; update() forces that.
+        self._status_var.set('Disconnecting')
+        self._root.update()
         self._stop_stream()
         self._reset_display_state()
         self._reconnect_retry_count = 0
+        self._sdr_var.set(entry['name'])
+        self._sdr_combo.selection_clear()
         self._start_stream(entry)
         self._active_sdr = entry
+
+    def _apply_control_bar_theme(self):
+        """Re-check the desktop's light/dark setting and re-tint the control
+        bar if it changed, then reschedule itself -- so a Breeze theme
+        switch while the app is running is picked up live, not just at
+        startup."""
+        dark = _detect_dark_theme()
+        if dark != self._theme_dark:
+            self._theme_dark = dark
+            colors = CONTROL_BAR_COLORS['dark' if dark else 'light']
+            self._style.configure('Control.TFrame', background=colors['bg'])
+            self._style.configure('Control.TLabel', background=colors['bg'], foreground=colors['fg'])
+            # Status.TLabel is deliberately left out here -- pinned to a
+            # fixed light background in _build_ui (see comment there).
+        self._root.after(THEME_POLL_MS, self._apply_control_bar_theme)
 
     def _toggle_stream(self):
         if self._stopped:
@@ -2066,6 +2165,8 @@ class PanadapterApp:
             self._stopped = False
             self._stop_btn_var.set('Stop')
         else:
+            self._status_var.set('Disconnecting')
+            self._root.update()
             self._stop_stream()
             self._active_sdr = None
             self._stopped = True
@@ -2073,7 +2174,7 @@ class PanadapterApp:
             self._redraw()
             self._freq_var.set('-- kHz')
             self._dbm_var.set('-- dBm')
-            self._status_var.set('stopped')
+            self._status_var.set('Stopped')
             self._stop_btn_var.set('Start')
 
     # -- Auto/Manual toggle + Zoom/Band/Mode/B-W combos -------------------------------
@@ -2113,7 +2214,7 @@ class PanadapterApp:
     def _toggle_auto_manual(self):
         if self._manual:
             self._manual = False
-            self._auto_btn_var.set('Manual')
+            self._auto_btn_var.set('Auto')
         else:
             # Carry the current Auto (rigctl-driven) frequency/band into
             # Manual, rather than jumping to wherever Manual was last left --
@@ -2152,7 +2253,7 @@ class PanadapterApp:
                 except Exception as e:
                     logging.debug('failed to save manual_freq_khz: %s', e)
             self._manual = True
-            self._auto_btn_var.set('Auto')
+            self._auto_btn_var.set('Manual')
         try:
             save_config_value(self._options.config, 'manual_active', self._manual)
         except Exception as e:
@@ -2374,7 +2475,7 @@ class PanadapterApp:
             pass
 
         if latest is not None:
-            self._status_var.set('connected')
+            self._status_var.set('Connected')
             self._freq_var.set('%.3f kHz' % latest['center'])
             self._ingest_row(latest)
             self._redraw()
@@ -2566,7 +2667,7 @@ class PanadapterApp:
                 marker_freq = self._current_freq_khz
         if marker_freq is not None and start_khz <= marker_freq <= stop_khz:
             x = int((marker_freq - start_khz) / span * w)
-            c.create_line(x, 0, x, h, fill=marker_color, width=1)
+            c.create_line(x, 0, x, h, fill=marker_color, width=2)
 
         # Passband indicator: a thin yellow line just above the waterfall's
         # top edge (this strip's bottom row), spanning the active demod

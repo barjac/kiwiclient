@@ -9,3 +9,5 @@ Weston                        websdr.uk                 8076  mimic_browser
 DB0WHM                        db0whm.hamnet.network     8073  mimic_browser
 Spalding Lincs - M0CKE        m0cke.proxy.kiwisdr.com   8073  mimic_browser
 G3SDR                         g3sdr.com                 8074  mimic_browser
+Pretoria ZA                   kiwisdr.r7d.xyz           8073  mimic_browser
+Johannesburg ZA               jnb.twrmon.net            8073  mimic_browser
