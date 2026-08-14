@@ -57,6 +57,12 @@ RECONNECT_HEALTHY_RESET_SEC = 3.0  # a stream up this long counts as recovered -
                                     # regardless; without this, that alone exhausts MAX_RECONNECT_RETRIES and
                                     # the app gives up for good even though every individual reconnect works)
 THEME_POLL_MS = 5000  # how often to re-check the desktop's light/dark setting
+RIG_STALE_TIMEOUT_SEC = 5.0  # how long without a successful rigctl poll (Auto mode) before the
+                              # frequency readout switches to "No rig data" -- RigctlPoller's own
+                              # connect/read failures only ever log at debug level, so without this
+                              # a dead/not-yet-responsive rigctld link is otherwise silently invisible:
+                              # the waterfall just sits on default_freq showing perfectly normal-looking
+                              # (but meaningless) data forever, with no on-screen sign anything's wrong.
 
 # Control-bar tint per theme -- ttk Frame/Label don't inherit the desktop
 # theme's own background/text colors like the Buttons/Comboboxes left at
@@ -1601,6 +1607,11 @@ class PanadapterApp:
         self._freq_major_khz = options.freq_major_khz
         self._freq_minor_khz = options.freq_minor_khz
         self._current_freq_khz = None
+        # Timestamp of the last successful (plausible) rigctl poll -- None
+        # means Auto has never had one yet since (re)start. Used only to
+        # detect a stale/dead rig link for the "No rig data" readout warning
+        # in _poll_queue; not used for anything retune-related.
+        self._last_rig_update_ts = None
         self._freq_lock = threading.Lock()
         self._row_queue = queue.Queue(maxsize=2)
         self._img_buf = np.zeros((MAX_HISTORY_ROWS, WF_NATIVE_BINS, 3), dtype=np.uint8)
@@ -2378,6 +2389,7 @@ class PanadapterApp:
         if not is_plausible_freq_khz(freq_khz):
             logging.warning('ignoring implausible rigctl frequency %.3f kHz', freq_khz)
             return
+        self._last_rig_update_ts = time.time()
         with self._freq_lock:
             changed = self._current_freq_khz != freq_khz
             self._current_freq_khz = freq_khz
@@ -2479,6 +2491,17 @@ class PanadapterApp:
             self._freq_var.set('%.3f kHz' % latest['center'])
             self._ingest_row(latest)
             self._redraw()
+
+        # The Kiwi keeps streaming perfectly normal-looking waterfall rows
+        # regardless of whether rigctl is actually reachable -- the numeric
+        # readout above would otherwise just look confidently correct while
+        # secretly still parked on default_freq. Overridden every tick
+        # (rather than only when latest is set) since rows keep arriving
+        # even while the rig link is dead.
+        if (not self._manual) and (not self._stopped) and (
+                self._last_rig_update_ts is None
+                or time.time() - self._last_rig_update_ts > RIG_STALE_TIMEOUT_SEC):
+            self._freq_var.set('No rig data')
 
         self._root.after(150, self._poll_queue)
 

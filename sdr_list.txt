@@ -11,3 +11,4 @@ Spalding Lincs - M0CKE        m0cke.proxy.kiwisdr.com   8073  mimic_browser
 G3SDR                         g3sdr.com                 8074  mimic_browser
 Pretoria ZA                   kiwisdr.r7d.xyz           8073  mimic_browser
 Johannesburg ZA               jnb.twrmon.net            8073  mimic_browser
+Hebburn                       82.45.69.102              8073  mimic_browser
