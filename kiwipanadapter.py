@@ -1996,6 +1996,28 @@ class PanadapterApp:
             self._start_wf_connection(sdr_entry, freq, mimic_browser)
             self._start_audio_connection(sdr_entry, freq, mimic_browser)
 
+        # Re-sync the freshly created streams to whatever self._current_freq_khz
+        # holds *now*, not just the value read at the top of this function --
+        # connection setup above (browser-mimic prefetch, the mimic_browser
+        # 0.25s stagger, the handshake itself) can take long enough for one or
+        # more rigctl polls to land in between, updating self._current_freq_khz
+        # while self._wf_stream/self._audio_stream were still None. Since
+        # _on_rigctl_freq only retunes when the value *changes*, and a static
+        # rig frequency never changes again on later polls, a retune missed
+        # this way was otherwise never retried -- the stream stayed on its
+        # construction-time freq forever, only fixed by chance (a later
+        # actual frequency change, or recreating the streams via Stop/Start,
+        # an SDR switch, or a reconnect). Live-diagnosed 2026-08-14: stuck on
+        # default_freq with rigctl polling successfully the whole time.
+        if not self._manual:
+            with self._freq_lock:
+                freq_now = self._current_freq_khz
+            if freq_now is not None:
+                if self._wf_stream is not None:
+                    self._wf_stream.retune(freq_now)
+                if self._audio_stream is not None:
+                    self._audio_stream.retune(freq_now)
+
         self._status_var.set('Connecting')
         self._stream_start_ts = time.time()
         if self._manual:
