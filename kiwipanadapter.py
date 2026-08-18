@@ -63,6 +63,7 @@ RIG_STALE_TIMEOUT_SEC = 5.0  # how long without a successful rigctl poll (Auto m
                               # a dead/not-yet-responsive rigctld link is otherwise silently invisible:
                               # the waterfall just sits on default_freq showing perfectly normal-looking
                               # (but meaningless) data forever, with no on-screen sign anything's wrong.
+FINE_TUNE_STEP_HZ = 5.0  # per-click Manual-mode nudge from the </> fine-tune buttons
 
 # Control-bar tint per theme -- ttk Frame/Label don't inherit the desktop
 # theme's own background/text colors like the Buttons/Comboboxes left at
@@ -314,6 +315,7 @@ CONFIG_SCHEMA = {
     'resample': int,
     'ifreq': float,
     'auto_mode_by_band': parse_bool,
+    'sdr_freq_offset_hz': float,
     'manual_active': parse_bool,
     'manual_freq_khz': float,
     'manual_band': str,
@@ -524,6 +526,10 @@ def load_config(path):
             f.write("# instead of trusting whatever mode rigctl reports -- needed when the rig\n")
             f.write("# (e.g. a plain Hamlib Dummy backend) never actually sets LSB below 10MHz.\n")
             f.write("auto_mode_by_band  false\n")
+            f.write("# Calibration trim (Hz) added to the SDR's actual tuned frequency only --\n")
+            f.write("# corrects a fixed audio-tone offset FreeDV hears, e.g. Kiwi clock error.\n")
+            f.write("# Adjustable live via the </> buttons either side of the freq readout.\n")
+            f.write("sdr_freq_offset_hz  0\n")
             f.write("smeter_decay_db_sec  20\n")
             f.write("smeter_cal_db  12\n")
             f.write("smeter_peak_hold_sec  3\n")
@@ -1612,6 +1618,12 @@ class PanadapterApp:
         self._freq_major_khz = options.freq_major_khz
         self._freq_minor_khz = options.freq_minor_khz
         self._current_freq_khz = None
+        # Calibration trim (Hz) added to the tracked dial frequency only at
+        # the point of actually tuning the SDR -- corrects a fixed audio-tone
+        # offset FreeDV hears (e.g. Kiwi clock error), without touching the
+        # dial frequency used for the readout, band detection, or passband
+        # indicator, all of which stay referenced to the true frequency.
+        self._sdr_freq_offset_hz = options.sdr_freq_offset_hz
         # Timestamp of the last successful (plausible) rigctl poll -- None
         # means Auto has never had one yet since (re)start. Used only to
         # detect a stale/dead rig link for the "No rig data" readout warning
@@ -1800,10 +1812,26 @@ class PanadapterApp:
         # a growing left side (more combos added over time) can exhaust the
         # bar's width and get this pushed off/cropped instead of just
         # squeezing the left-side controls, which is the much less
-        # important side to lose room to.
+        # important side to lose room to. The fine-tune buttons are packed
+        # as part of this same right-hand group, both to the left of the
+        # freq label -- these trim the actual SDR tuning
+        # (sdr_freq_offset_hz), not the tracked dial frequency, so they're
+        # active in both Auto and Manual.
+        freq_frame = ttk.Frame(top, style='Control.TFrame')
+        freq_frame.pack(side='right')
+        self._freq_down_btn = ttk.Button(freq_frame, text='◄', width=2,
+                                          command=lambda: self._nudge_sdr_offset(-FINE_TUNE_STEP_HZ))
+        self._freq_down_btn.pack(side='left', padx=(0, 2))
+        _Tooltip(self._freq_down_btn, lambda: 'SDR trim %+g Hz (currently %+g Hz)' % (
+            -FINE_TUNE_STEP_HZ, self._sdr_freq_offset_hz))
+        self._freq_up_btn = ttk.Button(freq_frame, text='►', width=2,
+                                        command=lambda: self._nudge_sdr_offset(FINE_TUNE_STEP_HZ))
+        self._freq_up_btn.pack(side='left', padx=(0, 4))
+        _Tooltip(self._freq_up_btn, lambda: 'SDR trim %+g Hz (currently %+g Hz)' % (
+            FINE_TUNE_STEP_HZ, self._sdr_freq_offset_hz))
         self._freq_var = tk.StringVar(value='-- kHz')
-        ttk.Label(top, textvariable=self._freq_var, font=('TkFixedFont', 11, 'bold'),
-                  style='Control.TLabel').pack(side='right')
+        ttk.Label(freq_frame, textvariable=self._freq_var, font=('TkFixedFont', 11, 'bold'),
+                  style='Control.TLabel').pack(side='left')
 
         ttk.Label(top, text='SDR:', style='Control.TLabel').pack(side='left')
         self._sdr_var = tk.StringVar(value=self._initial_sdr['name'])
@@ -1967,7 +1995,8 @@ class PanadapterApp:
 
     def _start_stream(self, sdr_entry):
         with self._freq_lock:
-            freq = self._current_freq_khz if self._current_freq_khz is not None else self._options.default_freq
+            dial_freq = self._current_freq_khz if self._current_freq_khz is not None else self._options.default_freq
+        freq = self._sdr_tune_freq(dial_freq)
         mimic_browser = sdr_entry.get('mimic_browser', False)
         no_sound = sdr_entry.get('no_sound', False)
 
@@ -2019,9 +2048,9 @@ class PanadapterApp:
                 freq_now = self._current_freq_khz
             if freq_now is not None:
                 if self._wf_stream is not None:
-                    self._wf_stream.retune(freq_now)
+                    self._wf_stream.retune(self._sdr_tune_freq(freq_now))
                 if self._audio_stream is not None:
-                    self._audio_stream.retune(freq_now)
+                    self._audio_stream.retune(self._sdr_tune_freq(freq_now))
 
         self._status_var.set('Connecting')
         self._stream_start_ts = time.time()
@@ -2410,6 +2439,29 @@ class PanadapterApp:
 
     # -- frequency/mode tracking ------------------------------------------------------
 
+    def _sdr_tune_freq(self, dial_freq_khz):
+        """The single choke point where the tracked dial frequency (true rig
+        frequency in Auto, or the user-set frequency in Manual) is converted
+        to what's actually sent to the Kiwi -- everywhere else (readout, band
+        detection, passband indicator) stays referenced to dial_freq_khz
+        itself, so the trim only ever shifts where the SDR listens, not what
+        kiwipanadapter believes it's tuned to."""
+        return dial_freq_khz + self._sdr_freq_offset_hz / 1000.0
+
+    def _nudge_sdr_offset(self, delta_hz):
+        self._sdr_freq_offset_hz += delta_hz
+        try:
+            save_config_value(self._options.config, 'sdr_freq_offset_hz', self._sdr_freq_offset_hz)
+        except Exception as e:
+            logging.debug('failed to save sdr_freq_offset_hz: %s', e)
+        with self._freq_lock:
+            current_freq = self._current_freq_khz
+        if current_freq is not None:
+            if self._wf_stream is not None:
+                self._wf_stream.retune(self._sdr_tune_freq(current_freq))
+            if self._audio_stream is not None:
+                self._audio_stream.retune(self._sdr_tune_freq(current_freq))
+
     def _on_rigctl_freq(self, freq_khz):
         if self._manual:
             return   # Manual owns the frequency -- ignore FreeDV/rigctl until switched back to Auto
@@ -2422,9 +2474,9 @@ class PanadapterApp:
             self._current_freq_khz = freq_khz
         if changed:
             if self._wf_stream is not None:
-                self._wf_stream.retune(freq_khz)
+                self._wf_stream.retune(self._sdr_tune_freq(freq_khz))
             if self._audio_stream is not None:
-                self._audio_stream.retune(freq_khz)
+                self._audio_stream.retune(self._sdr_tune_freq(freq_khz))
 
     def _on_rigctl_mode(self, mode, passband_hz):
         if self._manual:
@@ -2472,9 +2524,9 @@ class PanadapterApp:
         with self._freq_lock:
             self._current_freq_khz = freq_khz
         if self._wf_stream is not None:
-            self._wf_stream.retune(freq_khz)
+            self._wf_stream.retune(self._sdr_tune_freq(freq_khz))
         if self._audio_stream is not None:
-            self._audio_stream.retune(freq_khz)
+            self._audio_stream.retune(self._sdr_tune_freq(freq_khz))
 
     def _compute_bw_passband(self, mode, bw_name):
         """center/width (self._bw_hz, a positive offset+width from the dial
@@ -2892,6 +2944,12 @@ def parse_args():
                     help='in Auto mode, derive LSB/USB from the tuned band convention instead of '
                          'trusting rigctl\'s reported mode -- works around rigs/Dummy backends that '
                          'never set LSB below 10MHz (config: auto_mode_by_band, default false)')
+    p.add_argument('--sdr-freq-offset', dest='sdr_freq_offset_hz', type=float,
+                    default=cfg.get('sdr_freq_offset_hz', 0.0),
+                    help='calibration trim in Hz added to the SDR\'s actual tuned frequency only '
+                         '(corrects a fixed audio-tone offset FreeDV hears, e.g. Kiwi clock error) -- '
+                         'live-adjustable via the </> buttons either side of the freq readout '
+                         '(config: sdr_freq_offset_hz, default 0)')
     p.add_argument('--span', dest='span', type=float, default=cfg.get('span_khz', 50.0),
                     help='total span in kHz shown, centered on the tracked frequency (config: span_khz, default 50 = +/-25kHz)')
     p.add_argument('--mindb', type=float, default=cfg.get('mindb', -120.0),
