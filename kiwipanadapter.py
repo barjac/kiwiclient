@@ -313,6 +313,7 @@ CONFIG_SCHEMA = {
     'de_emp': parse_bool,
     'resample': int,
     'ifreq': float,
+    'auto_mode_by_band': parse_bool,
     'manual_active': parse_bool,
     'manual_freq_khz': float,
     'manual_band': str,
@@ -519,6 +520,10 @@ def load_config(path):
             f.write("rigctl_host     127.0.0.1\n")
             f.write("rigctl_port     6400\n")
             f.write("default_freq    14200\n")
+            f.write("# Derive Auto-mode sideband (LSB/USB) from the tuned band's convention\n")
+            f.write("# instead of trusting whatever mode rigctl reports -- needed when the rig\n")
+            f.write("# (e.g. a plain Hamlib Dummy backend) never actually sets LSB below 10MHz.\n")
+            f.write("auto_mode_by_band  false\n")
             f.write("smeter_decay_db_sec  20\n")
             f.write("smeter_cal_db  12\n")
             f.write("smeter_peak_hold_sec  3\n")
@@ -2434,6 +2439,16 @@ class PanadapterApp:
             # itself (which sideband to actually demodulate) still comes
             # from hamlib as the source of truth -- only the passband shape
             # is overridden.
+            if self._options.auto_mode_by_band:
+                # Some rigs (e.g. a plain Hamlib Dummy backend, never given
+                # an explicit SET_MODE) just sit on one fixed mode regardless
+                # of band -- that reads as "stuck on USB" once tuned below
+                # 10MHz, where convention is LSB. Override with the band's
+                # conventional sideband instead of trusting rigctl here.
+                with self._freq_lock:
+                    current_freq = self._current_freq_khz
+                band = band_for_freq(current_freq) if current_freq is not None else None
+                mode = BAND_DEFAULT_MODE.get(band, mode)
             lowcut_hz, highcut_hz = self._compute_bw_passband(mode, 'FreeDV')
             self._pb_lowcut_hz = lowcut_hz
             self._pb_highcut_hz = highcut_hz
@@ -2872,6 +2887,11 @@ def parse_args():
                     help='rigctld host to follow for frequency/mode, same as FreeDV (config: rigctl_host, default 127.0.0.1)')
     p.add_argument('--rigctl-port', type=int, default=cfg.get('rigctl_port', 6400),
                     help='rigctld port to follow for frequency/mode (config: rigctl_port, default 6400)')
+    p.add_argument('--auto-mode-by-band', dest='auto_mode_by_band', action='store_true',
+                    default=cfg.get('auto_mode_by_band', False),
+                    help='in Auto mode, derive LSB/USB from the tuned band convention instead of '
+                         'trusting rigctl\'s reported mode -- works around rigs/Dummy backends that '
+                         'never set LSB below 10MHz (config: auto_mode_by_band, default false)')
     p.add_argument('--span', dest='span', type=float, default=cfg.get('span_khz', 50.0),
                     help='total span in kHz shown, centered on the tracked frequency (config: span_khz, default 50 = +/-25kHz)')
     p.add_argument('--mindb', type=float, default=cfg.get('mindb', -120.0),
