@@ -64,6 +64,15 @@ RIG_STALE_TIMEOUT_SEC = 5.0  # how long without a successful rigctl poll (Auto m
                               # the waterfall just sits on default_freq showing perfectly normal-looking
                               # (but meaningless) data forever, with no on-screen sign anything's wrong.
 FINE_TUNE_STEP_HZ = 5.0  # per-click Manual-mode nudge from the </> fine-tune buttons
+STREAM_STALE_TIMEOUT_SEC = 10.0  # how long a stream can go without delivering any actual
+                                  # data before it's treated as dead and reconnected -- a TCP
+                                  # socket can stay open (run_event still set, _poll_reconnect's
+                                  # existing wf_down/audio_down checks both blind to this) while
+                                  # the Kiwi has silently stopped sending on it. Live-observed:
+                                  # W/F kept updating normally (status showed "Connected") while
+                                  # the SND side had gone silent -- no sound until a manual
+                                  # Stop/Start. Checked per-side so a stalled audio channel alone
+                                  # is enough to trigger a reconnect even though W/F looks fine.
 
 # Control-bar tint per theme -- ttk Frame/Label don't inherit the desktop
 # theme's own background/text colors like the Buttons/Comboboxes left at
@@ -866,6 +875,11 @@ class LiveWFStream(KiwiSDRStream):
         self._pending_freq = None
         self._pending_span_khz = None
         self._lock = threading.Lock()
+        # Set at construction (rather than left None) so a fresh stream gets
+        # one full STREAM_STALE_TIMEOUT_SEC grace period to complete its
+        # handshake and deliver a first row before _poll_reconnect could
+        # treat it as stalled.
+        self._last_data_ts = time.time()
 
     def _setup_rx_params(self):
         # self.MAX_FREQ (kiwi/client.py's KiwiSDRStream) starts at the 30 MHz
@@ -898,6 +912,7 @@ class LiveWFStream(KiwiSDRStream):
             self._pending_span_khz = span_khz
 
     def _process_waterfall_samples(self, seq, samples):
+        self._last_data_ts = time.time()
         with self._lock:
             pending = self._pending_freq
             self._pending_freq = None
@@ -1009,6 +1024,10 @@ class LiveAudioStream(KiwiSDRStream):
         # actual player teardown only ever runs once.
         self._close_lock = threading.Lock()
         self._closed = False
+        # See LiveWFStream._last_data_ts -- same purpose, stamped in
+        # _queue_audio() (the single choke point all three sample-format
+        # handlers funnel through) rather than per-handler.
+        self._last_data_ts = time.time()
 
     # -- retuning: replaces the old separate-process rigctld-mirror RPC.
     # Both pending values are drained and applied together in
@@ -1120,6 +1139,7 @@ class LiveAudioStream(KiwiSDRStream):
 
     def _queue_audio(self, samples):
         """Queue audio samples for non-blocking playback. Accumulates if queue is full."""
+        self._last_data_ts = time.time()
         self._update_playback_rate_adjustment()
 
         if self._playback_rate_adjustment != 1.0:
@@ -2102,7 +2122,23 @@ class PanadapterApp:
                        and not self._run_event.is_set())
             audio_down = (self._audio_worker is not None and self._audio_run_event is not None
                           and not self._audio_run_event.is_set())
-            if wf_down or audio_down:
+            # wf_down/audio_down above only catch a socket that's actually
+            # closed -- a Kiwi can also leave the TCP connection up while
+            # silently no longer sending on it (run_event stays set forever
+            # in that case), which live-showed as "Connected" with a normal
+            # waterfall but dead audio until a manual Stop/Start. Catch that
+            # here by timing out on *data*, not just socket state, checked
+            # independently per side.
+            now = time.time()
+            wf_stale = (self._worker is not None and self._wf_stream is not None
+                        and now - self._wf_stream._last_data_ts > STREAM_STALE_TIMEOUT_SEC)
+            audio_stale = (self._audio_worker is not None and self._audio_stream is not None
+                           and now - self._audio_stream._last_data_ts > STREAM_STALE_TIMEOUT_SEC)
+            if wf_down or audio_down or wf_stale or audio_stale:
+                if wf_stale or audio_stale:
+                    logging.warning('%s stream on %s stalled (no data for %.0fs), reconnecting',
+                                     'W/F' if wf_stale else 'audio', self._active_sdr['name'],
+                                     STREAM_STALE_TIMEOUT_SEC)
                 self._schedule_reconnect()
             elif (self._reconnect_retry_count > 0 and self._stream_start_ts is not None
                   and time.time() - self._stream_start_ts >= RECONNECT_HEALTHY_RESET_SEC):
