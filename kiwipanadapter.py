@@ -259,25 +259,35 @@ def band_for_freq(freq_khz):
             return name
     return None
 
-# B/W combo presets: each is a (center_hz, width_hz) pair defining the audio
-# demod passband -- configurable via 'bw_<name>_center_hz'/'bw_<name>_width_hz'.
-# 'FreeDV' defaults match the existing smeter_passband_* defaults; 'CW'
-# defaults to a narrow filter around a typical sidetone pitch. 'SSBN'/'SSBW'
-# are narrow/wide SSB alternatives to the default 'SSB'; 'AMW' is a wide,
-# zero-centered AM passband (_compute_bw_passband/LiveAudioStream's own AM
-# handling both force lowcut = -highcut for AM regardless of center_hz, so
-# center_hz here is unused for AM -- width_hz alone gives the +/-6kHz).
-BW_NAMES = ['SSB', 'SSBN', 'SSBW', 'FreeDV', 'CW', 'AMW']
+# Mode combo presets -- a single combo replaces the old separate Mode
+# (USB/LSB/AM) + B/W (SSB/FreeDV/CW/...) pair. Each entry is a (center_hz,
+# width_hz) audio passband, configurable via 'bw_<name>_center_hz'/
+# 'bw_<name>_width_hz' -- the underlying demod (which sideband, or AM) is no
+# longer part of the combo selection at all: MODE_AM_NAMES entries always
+# demod as AM (center_hz unused there -- _compute_bw_passband/
+# LiveAudioStream's own AM handling both force lowcut = -highcut regardless,
+# so only width_hz matters); every other entry demods as USB/LSB, resolved
+# live from the tuned band's convention (BAND_DEFAULT_MODE) and optionally
+# flipped by the "reverse sideband" checkbox -- never stored in the combo
+# itself. 'FDV' defaults match the existing smeter_passband_* defaults;
+# 'FDV2' is a narrower FreeDV variant (e.g. the narrower digital modes);
+# 'CW' defaults to a narrow filter around a typical sidetone pitch;
+# 'SSBN'/'SSBW' are narrow/wide SSB alternatives to 'SSB'; 'AMN'/'AM'/'AMW'
+# are narrow/normal/wide AM alternatives, spaced like a typical rig's AM
+# filter set (narrow for crowded conditions, wide for higher fidelity).
+MODE_NAMES = ['FDV', 'FDV2', 'SSB', 'SSBN', 'SSBW', 'AM', 'AMN', 'AMW', 'CW']
+MODE_AM_NAMES = {'AM', 'AMN', 'AMW'}
 BW_DEFAULT_HZ = {
+    'FDV': (1500.0, 2400.0),
+    'FDV2': (1500.0, 1000.0),
     'SSB': (1500.0, 3000.0),
     'SSBN': (1200.0, 2400.0),
     'SSBW': (2000.0, 4000.0),
-    'FreeDV': (1500.0, 2400.0),
-    'CW': (750.0, 500.0),
+    'AM': (0.0, 6000.0),
+    'AMN': (0.0, 4000.0),
     'AMW': (0.0, 12000.0),
+    'CW': (750.0, 500.0),
 }
-
-MODE_NAMES = ['USB', 'LSB', 'AM']
 
 # Mirrors kiwi/client.py's own (private, per-instance) _default_passbands
 # table -- used here only to draw the yellow passband indicator for Auto/
@@ -331,12 +341,12 @@ CONFIG_SCHEMA = {
     'resample': int,
     'ifreq': float,
     'auto_mode_by_band': parse_bool,
+    'reverse_sideband': parse_bool,
     'sdr_freq_offset_hz': float,
     'manual_active': parse_bool,
     'manual_freq_khz': float,
     'manual_band': str,
     'manual_mode': str,
-    'manual_bw': str,
     'zoom_span_khz': float,
     'zoom_steps_khz': parse_float_list,
 }
@@ -346,7 +356,7 @@ for _name in BAND_NAMES:
     # from band_<name>_khz above, which is the fixed preset center. Absent
     # until a band's actually been visited and left in Manual.
     CONFIG_SCHEMA['band_%s_last_khz' % _name] = float
-for _name in BW_NAMES:
+for _name in MODE_NAMES:
     CONFIG_SCHEMA['bw_%s_center_hz' % _name.lower()] = float
     CONFIG_SCHEMA['bw_%s_width_hz' % _name.lower()] = float
 
@@ -542,6 +552,10 @@ def load_config(path):
             f.write("# instead of trusting whatever mode rigctl reports -- needed when the rig\n")
             f.write("# (e.g. a plain Hamlib Dummy backend) never actually sets LSB below 10MHz.\n")
             f.write("auto_mode_by_band  false\n")
+            f.write("# Flips the band-convention sideband picked above (and Manual mode's own\n")
+            f.write("# same band-convention lookup) -- an escape hatch for the rare occasion the\n")
+            f.write("# conventional sideband isn't what's wanted.\n")
+            f.write("reverse_sideband  false\n")
             f.write("# Calibration trim (Hz) added to the SDR's actual tuned frequency only --\n")
             f.write("# corrects a fixed audio-tone offset FreeDV hears, e.g. Kiwi clock error.\n")
             f.write("# Adjustable live via the </> buttons either side of the freq readout.\n")
@@ -565,15 +579,14 @@ def load_config(path):
             f.write("manual_active   false\n")
             f.write("manual_freq_khz %s\n" % BAND_DEFAULT_KHZ['40m'])
             f.write("manual_band     40m\n")
-            f.write("manual_mode     usb\n")
-            f.write("manual_bw       FreeDV\n")
+            f.write("manual_mode     FDV\n")
             f.write("zoom_span_khz   50\n")
             f.write("zoom_steps_khz  %s\n" % ','.join(str(int(s)) for s in DEFAULT_ZOOM_STEPS_KHZ))
             f.write("\n# Band combo centers (kHz) -- edit freely, these are just placeholders\n")
             for _name in BAND_NAMES:
                 f.write("band_%-6s %s\n" % (_name + '_khz', BAND_DEFAULT_KHZ[_name]))
-            f.write("\n# B/W combo passband presets (Hz)\n")
-            for _name in BW_NAMES:
+            f.write("\n# Mode combo passband presets (Hz)\n")
+            for _name in MODE_NAMES:
                 center, width = BW_DEFAULT_HZ[_name]
                 key = _name.lower()
                 f.write("bw_%s_center_hz  %s\n" % (key, center))
@@ -1693,7 +1706,18 @@ class PanadapterApp:
         self._manual = options.manual_active
         self._manual_band = options.manual_band
         self._manual_mode = options.manual_mode
-        self._manual_bw = options.manual_bw
+        if self._manual_mode not in MODE_NAMES:
+            # Migrate a pre-merge config: manual_mode used to hold a raw
+            # sideband ('usb'/'lsb'/'am'), with the filter shape in a
+            # separate now-removed manual_bw key -- neither means anything
+            # as a Mode combo entry any more. Map old sideband values onto
+            # their nearest new preset rather than leaving an invalid
+            # selection the readonly combo can't actually display.
+            fallback = 'AM' if self._manual_mode.lower() == 'am' else 'SSB'
+            logging.info('manual_mode %r from config is not a known Mode preset, using %s instead',
+                         self._manual_mode, fallback)
+            self._manual_mode = fallback
+        self._reverse_sideband = options.reverse_sideband
         self._zoom_span_khz = options.zoom_span_khz
         self._zoom_steps_khz = options.zoom_steps_khz
         self._band_khz = {name: getattr(options, 'band_%s_khz' % name) for name in BAND_NAMES}
@@ -1740,7 +1764,7 @@ class PanadapterApp:
                 except Exception as e:
                     logging.debug('failed to save corrected manual_band: %s', e)
         self._bw_hz = {name: (getattr(options, 'bw_%s_center_hz' % name.lower()),
-                               getattr(options, 'bw_%s_width_hz' % name.lower())) for name in BW_NAMES}
+                               getattr(options, 'bw_%s_width_hz' % name.lower())) for name in MODE_NAMES}
         # Transient drag-to-tune state (see _on_wf_drag_*) -- not persisted.
         self._drag_start_x = None
         self._drag_start_freq_khz = None
@@ -1918,18 +1942,23 @@ class PanadapterApp:
         self._band_combo.bind('<<ComboboxSelected>>', self._on_band_change)
 
         ttk.Label(top, text='Mode:', style='Control.TLabel').pack(side='left')
-        self._mode_var = tk.StringVar(value=self._manual_mode.upper())
+        self._mode_var = tk.StringVar(value=self._manual_mode)
         self._mode_combo = ttk.Combobox(top, textvariable=self._mode_var, state=manual_combo_state,
-                                         width=5, values=MODE_NAMES)
+                                         width=6, values=MODE_NAMES)
         self._mode_combo.pack(side='left', padx=(2, 4))
         self._mode_combo.bind('<<ComboboxSelected>>', self._on_mode_change)
 
-        ttk.Label(top, text='B/W:', style='Control.TLabel').pack(side='left')
-        self._bw_var = tk.StringVar(value=self._manual_bw)
-        self._bw_combo = ttk.Combobox(top, textvariable=self._bw_var, state=manual_combo_state,
-                                       width=7, values=BW_NAMES)
-        self._bw_combo.pack(side='left', padx=(2, 4))
-        self._bw_combo.bind('<<ComboboxSelected>>', self._on_bw_change)
+        # Sideband (USB/LSB) is never picked directly any more -- every SSB-
+        # family Mode entry resolves it live from the tuned band's own
+        # convention (BAND_DEFAULT_MODE). This is the escape hatch for the
+        # rare case that's wrong for what's actually wanted, active in both
+        # Auto and Manual -- always enabled, unlike the combos above.
+        self._reverse_sideband_var = tk.BooleanVar(value=self._reverse_sideband)
+        self._reverse_sideband_chk = ttk.Checkbutton(top, text='Rev', variable=self._reverse_sideband_var,
+                                                       command=self._on_reverse_sideband_change)
+        self._reverse_sideband_chk.pack(side='left', padx=(0, 4))
+        _Tooltip(self._reverse_sideband_chk, lambda: 'Reverse sideband -- flip the band-convention '
+                 'LSB/USB choice (currently %s)' % ('on' if self._reverse_sideband_var.get() else 'off'))
 
         # S-meter sits between the control bar and the freq-axis bar, and
         # matches the freq-axis bar's height, so that if the window's bottom
@@ -2301,10 +2330,11 @@ class PanadapterApp:
         return ('%d kHz' % round(actual_khz))
 
     def _set_manual_combo_states(self, manual):
+        # The reverse-sideband checkbox deliberately isn't gated here --
+        # it's meaningful (and applied) in both Auto and Manual.
         state = 'readonly' if manual else 'disabled'
         self._band_combo.config(state=state)
         self._mode_combo.config(state=state)
-        self._bw_combo.config(state=state)
 
     def _toggle_rx_source(self):
         new_mode = 'SDR' if self._rx_source == 'RX' else 'RX'
@@ -2424,15 +2454,10 @@ class PanadapterApp:
         except Exception as e:
             logging.debug('failed to save manual_band: %s', e)
 
-        default_mode = BAND_DEFAULT_MODE.get(name)
-        if default_mode is not None and default_mode != self._manual_mode:
-            self._manual_mode = default_mode
-            self._mode_var.set(default_mode.upper())
-            try:
-                save_config_value(self._options.config, 'manual_mode', default_mode)
-            except Exception as e:
-                logging.debug('failed to save manual_mode: %s', e)
-
+        # No sideband to update here any more -- Mode entries resolve
+        # LSB/USB live from self._manual_band (just updated above), so
+        # _apply_manual_passband() below already picks up the new band's
+        # convention on its own.
         if self._manual:
             self._set_manual_freq(freq_khz)
             self._apply_manual_passband()
@@ -2444,7 +2469,7 @@ class PanadapterApp:
                 logging.debug('failed to save manual_freq_khz: %s', e)
 
     def _on_mode_change(self, _event):
-        self._manual_mode = self._mode_var.get().lower()
+        self._manual_mode = self._mode_var.get()
         try:
             save_config_value(self._options.config, 'manual_mode', self._manual_mode)
         except Exception as e:
@@ -2452,14 +2477,17 @@ class PanadapterApp:
         if self._manual:
             self._apply_manual_passband()
 
-    def _on_bw_change(self, _event):
-        self._manual_bw = self._bw_var.get()
+    def _on_reverse_sideband_change(self):
+        self._reverse_sideband = self._reverse_sideband_var.get()
         try:
-            save_config_value(self._options.config, 'manual_bw', self._manual_bw)
+            save_config_value(self._options.config, 'reverse_sideband', self._reverse_sideband)
         except Exception as e:
-            logging.debug('failed to save manual_bw: %s', e)
+            logging.debug('failed to save reverse_sideband: %s', e)
         if self._manual:
             self._apply_manual_passband()
+        # Auto mode picks this up on its own next rigctl poll tick
+        # (_on_rigctl_mode, RigctlPoller's own 0.5s cadence) -- no explicit
+        # re-apply needed here for that case.
 
     def _enabled_sdrs(self):
         return [s for s in self._sdr_list if not s.get('disabled')]
@@ -2544,7 +2572,9 @@ class PanadapterApp:
                     current_freq = self._current_freq_khz
                 band = band_for_freq(current_freq) if current_freq is not None else None
                 mode = BAND_DEFAULT_MODE.get(band, mode)
-            lowcut_hz, highcut_hz = self._compute_bw_passband(mode, 'FreeDV')
+            if self._reverse_sideband and mode.lower() in ('usb', 'lsb'):
+                mode = 'lsb' if mode.lower() == 'usb' else 'usb'
+            lowcut_hz, highcut_hz = self._compute_bw_passband(mode, 'FDV')
             self._pb_lowcut_hz = lowcut_hz
             self._pb_highcut_hz = highcut_hz
             if self._audio_stream is not None:
@@ -2591,20 +2621,34 @@ class PanadapterApp:
             lowcut_hz = -highcut_hz
         return lowcut_hz, highcut_hz
 
+    def _effective_demod(self, mode_name, band):
+        """Mode combo entry -> actual Kiwi demod type ('usb'/'lsb'/'am').
+        AM-family entries always demod as AM; every other entry resolves
+        USB/LSB live from the given band's convention (BAND_DEFAULT_MODE),
+        flipped by the reverse-sideband checkbox if set."""
+        if mode_name in MODE_AM_NAMES:
+            return 'am'
+        demod = BAND_DEFAULT_MODE.get(band, 'usb')
+        if self._reverse_sideband:
+            demod = 'lsb' if demod == 'usb' else 'usb'
+        return demod
+
     def _apply_manual_passband(self):
-        """(Re-)send the current Mode+B/W combo selection to the audio stream
-        -- called whenever either combo changes, and when switching into
-        Manual. No-op while stopped (no audio stream to send to)."""
+        """(Re-)send the current Mode combo selection to the audio stream --
+        called whenever Mode/Band/the reverse-sideband checkbox changes, and
+        when switching into Manual. No-op while stopped (no audio stream to
+        send to)."""
         if self._audio_stream is None:
             return
-        lowcut_hz, highcut_hz = self._compute_bw_passband(self._manual_mode, self._manual_bw)
+        demod = self._effective_demod(self._manual_mode, self._manual_band)
+        lowcut_hz, highcut_hz = self._compute_bw_passband(demod, self._manual_mode)
         self._pb_lowcut_hz = lowcut_hz
         self._pb_highcut_hz = highcut_hz
-        self._audio_stream.set_manual_passband(self._manual_mode, lowcut_hz, highcut_hz)
+        self._audio_stream.set_manual_passband(demod, lowcut_hz, highcut_hz)
 
     def _apply_manual_state(self):
-        """Re-apply the remembered Manual freq + Mode/B-W when switching
-        Auto -> Manual, so Manual resumes exactly where it left off."""
+        """Re-apply the remembered Manual freq + Mode when switching Auto ->
+        Manual, so Manual resumes exactly where it left off."""
         self._set_manual_freq(self._manual_freq_khz, save=False)
         self._apply_manual_passband()
 
@@ -2987,6 +3031,11 @@ def parse_args():
                     help='in Auto mode, derive LSB/USB from the tuned band convention instead of '
                          'trusting rigctl\'s reported mode -- works around rigs/Dummy backends that '
                          'never set LSB below 10MHz (config: auto_mode_by_band, default false)')
+    p.add_argument('--reverse-sideband', dest='reverse_sideband', action='store_true',
+                    default=cfg.get('reverse_sideband', False),
+                    help='flip the band-convention LSB/USB choice used by every SSB-family Mode '
+                         'entry, in both Auto and Manual -- an escape hatch for the rare case the '
+                         'conventional sideband isn\'t what\'s wanted (config: reverse_sideband, default false)')
     p.add_argument('--sdr-freq-offset', dest='sdr_freq_offset_hz', type=float,
                     default=cfg.get('sdr_freq_offset_hz', 0.0),
                     help='calibration trim in Hz added to the SDR\'s actual tuned frequency only '
@@ -3111,10 +3160,9 @@ def parse_args():
                     help='last/initial Manual-mode frequency in kHz (config: manual_freq_khz)')
     p.add_argument('--manual-band', dest='manual_band', default=cfg.get('manual_band', '40m'),
                     choices=BAND_NAMES, help='last/initial Band combo selection (config: manual_band)')
-    p.add_argument('--manual-mode', dest='manual_mode', default=cfg.get('manual_mode', 'usb'),
-                    help='last/initial Mode combo selection (config: manual_mode)')
-    p.add_argument('--manual-bw', dest='manual_bw', default=cfg.get('manual_bw', 'FreeDV'),
-                    help='last/initial B/W combo selection (config: manual_bw)')
+    p.add_argument('--manual-mode', dest='manual_mode', default=cfg.get('manual_mode', 'FDV'),
+                    help='last/initial Mode combo selection -- one of %s (config: manual_mode)'
+                         % ','.join(MODE_NAMES))
     p.add_argument('--zoom-span', dest='zoom_span_khz', type=float,
                     default=cfg.get('zoom_span_khz', cfg.get('span_khz', 50.0)),
                     help='last/initial Zoom combo span in kHz, used in both Auto and Manual '
@@ -3133,16 +3181,16 @@ def parse_args():
                         default=cfg.get(_last_key, None),
                         help='remembered last-used frequency for %s in kHz, used instead of the '
                              'preset above once this band has been visited (config: %s)' % (_name, _last_key))
-    for _name in BW_NAMES:
+    for _name in MODE_NAMES:
         _key = _name.lower()
         _default_center, _default_width = BW_DEFAULT_HZ[_name]
         p.add_argument('--bw-%s-center' % _key, dest='bw_%s_center_hz' % _key, type=float,
                         default=cfg.get('bw_%s_center_hz' % _key, _default_center),
-                        help='B/W combo "%s" passband center offset from dial frequency, in Hz '
+                        help='Mode combo "%s" passband center offset from dial frequency, in Hz '
                              '(config: bw_%s_center_hz)' % (_name, _key))
         p.add_argument('--bw-%s-width' % _key, dest='bw_%s_width_hz' % _key, type=float,
                         default=cfg.get('bw_%s_width_hz' % _key, _default_width),
-                        help='B/W combo "%s" passband width, in Hz (config: bw_%s_width_hz)' % (_name, _key))
+                        help='Mode combo "%s" passband width, in Hz (config: bw_%s_width_hz)' % (_name, _key))
     p.add_argument('--log-level', default='warn', choices=['debug', 'info', 'warn', 'error'])
     return p.parse_args()
 

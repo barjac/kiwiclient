@@ -33,6 +33,12 @@ smeter_decay_db_sec  6
 
 auto_mode_by_band  true
 
+# Flips the band-convention sideband picked above (and Manual mode's own
+# same band-convention lookup, see the Rev checkbox next to Mode) -- an
+# escape hatch for the rare occasion the conventional sideband isn't what's
+# actually wanted.
+reverse_sideband  false
+
 # Additive calibration offset for the computed S-meter reading -- tune
 # against a trusted reference (e.g. a webSDR on the same signal). Default
 # +12dB (2 S-units) since the panadapter's waterfall-derived reading ran
@@ -63,8 +69,7 @@ modulation      usb
 manual_active   false
 manual_freq_khz 7100.0
 manual_band     40m
-manual_mode     usb
-manual_bw       SSB
+manual_mode     SSB
 zoom_span_khz   50
 zoom_steps_khz  250,100,50,20,10
 
@@ -80,7 +85,17 @@ band_60m_khz 5340.0
 band_80m_khz 3700.0
 band_160m_khz 1900.0
 
-# B/W combo passband presets (Hz)
+# Mode combo passband presets (Hz) -- Mode itself no longer carries a
+# sideband selection (see reverse_sideband above); FDV/FDV2/SSB/SSBN/SSBW/CW
+# all resolve USB/LSB live from band convention, AM/AMN/AMW always demod as AM
+# (their center_hz is unused -- lowcut is forced to -highcut regardless, so
+# width_hz alone gives e.g. AMW's +/-6kHz).
+
+bw_fdv_center_hz  1500.0
+bw_fdv_width_hz   2400.0
+
+bw_fdv2_center_hz  1500.0
+bw_fdv2_width_hz   1000.0
 
 bw_ssb_center_hz  1500.0
 bw_ssb_width_hz   3000.0
@@ -91,14 +106,15 @@ bw_ssbn_width_hz   2400.0
 bw_ssbw_center_hz  2000.0
 bw_ssbw_width_hz   4000.0
 
-bw_freedv_center_hz  1500.0
-bw_freedv_width_hz   2400.0
-
 bw_cw_center_hz  750.0
 bw_cw_width_hz   500.0
 
-# AM has no lowcut of its own -- lowcut is forced to -highcut regardless of
-# center_hz, so width_hz alone gives the +/-6kHz passband.
+bw_am_center_hz  0.0
+bw_am_width_hz   6000.0
+
+bw_amn_center_hz  0.0
+bw_amn_width_hz   4000.0
+
 bw_amw_center_hz  0.0
 bw_amw_width_hz   12000.0
 
