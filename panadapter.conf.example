@@ -20,11 +20,18 @@ maxdb           -40
 # reverted: some Kiwis only deliver waterfall data to a connection actually
 # opened as W/F, never to one opened as SND regardless of which commands
 # are sent on it.)
+
 rigctl_host     127.0.0.1
 rigctl_port     4532
 
 default_freq    5368.5
 smeter_decay_db_sec  6
+
+# Derive Auto-mode sideband (LSB/USB) from the tuned band's convention
+# instead of trusting whatever mode rigctl reports -- needed since the
+# Hamlib Dummy backend never actually sets LSB below 10MHz on its own.
+
+auto_mode_by_band  true
 
 # Additive calibration offset for the computed S-meter reading -- tune
 # against a trusted reference (e.g. a webSDR on the same signal). Default
@@ -57,7 +64,7 @@ manual_active   false
 manual_freq_khz 7100.0
 manual_band     40m
 manual_mode     usb
-manual_bw       FreeDV
+manual_bw       SSB
 zoom_span_khz   50
 zoom_steps_khz  250,100,50,20,10
 
@@ -74,9 +81,25 @@ band_80m_khz 3700.0
 band_160m_khz 1900.0
 
 # B/W combo passband presets (Hz)
+
 bw_ssb_center_hz  1500.0
 bw_ssb_width_hz   3000.0
+
+bw_ssbn_center_hz  1200.0
+bw_ssbn_width_hz   2400.0
+
+bw_ssbw_center_hz  2000.0
+bw_ssbw_width_hz   4000.0
+
 bw_freedv_center_hz  1500.0
 bw_freedv_width_hz   2400.0
+
 bw_cw_center_hz  750.0
 bw_cw_width_hz   500.0
+
+# AM has no lowcut of its own -- lowcut is forced to -highcut regardless of
+# center_hz, so width_hz alone gives the +/-6kHz passband.
+bw_amw_center_hz  0.0
+bw_amw_width_hz   12000.0
+
+sdr_freq_offset_hz    0.0

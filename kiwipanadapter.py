@@ -262,12 +262,19 @@ def band_for_freq(freq_khz):
 # B/W combo presets: each is a (center_hz, width_hz) pair defining the audio
 # demod passband -- configurable via 'bw_<name>_center_hz'/'bw_<name>_width_hz'.
 # 'FreeDV' defaults match the existing smeter_passband_* defaults; 'CW'
-# defaults to a narrow filter around a typical sidetone pitch.
-BW_NAMES = ['SSB', 'FreeDV', 'CW']
+# defaults to a narrow filter around a typical sidetone pitch. 'SSBN'/'SSBW'
+# are narrow/wide SSB alternatives to the default 'SSB'; 'AMW' is a wide,
+# zero-centered AM passband (_compute_bw_passband/LiveAudioStream's own AM
+# handling both force lowcut = -highcut for AM regardless of center_hz, so
+# center_hz here is unused for AM -- width_hz alone gives the +/-6kHz).
+BW_NAMES = ['SSB', 'SSBN', 'SSBW', 'FreeDV', 'CW', 'AMW']
 BW_DEFAULT_HZ = {
     'SSB': (1500.0, 3000.0),
+    'SSBN': (1200.0, 2400.0),
+    'SSBW': (2000.0, 4000.0),
     'FreeDV': (1500.0, 2400.0),
     'CW': (750.0, 500.0),
+    'AMW': (0.0, 12000.0),
 }
 
 MODE_NAMES = ['USB', 'LSB', 'AM']
