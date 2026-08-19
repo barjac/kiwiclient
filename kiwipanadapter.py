@@ -294,6 +294,20 @@ BW_DEFAULT_HZ = {
     'CW': (750.0, 500.0),
 }
 
+
+def validate_mode_name(value, config_key, fallback):
+    """A Mode combo config value (manual_mode/auto_mode) that isn't a known
+    MODE_NAMES entry -- e.g. a pre-merge config's raw sideband ('usb'/'lsb'/
+    'am') from before Mode+B/W were combined into one combo, or just a typo
+    -- would otherwise be an invalid selection the readonly combo can't
+    actually display. Map it onto the given fallback instead, preferring
+    'AM' when the stale value at least says 'am'."""
+    if value in MODE_NAMES:
+        return value
+    resolved = 'AM' if value.lower() == 'am' else fallback
+    logging.info('%s %r from config is not a known Mode preset, using %s instead', config_key, value, resolved)
+    return resolved
+
 # Mirrors kiwi/client.py's own (private, per-instance) _default_passbands
 # table -- used here only to draw the yellow passband indicator for Auto/
 # rigctl-driven modes, where only a highcut width (not a full lowcut/highcut
@@ -352,6 +366,7 @@ CONFIG_SCHEMA = {
     'manual_freq_khz': float,
     'manual_band': str,
     'manual_mode': str,
+    'auto_mode': str,
     'zoom_span_khz': float,
     'zoom_steps_khz': parse_float_list,
 }
@@ -580,11 +595,15 @@ def load_config(path):
             f.write("modulation      usb\n")
             f.write("ncomp           false\n")
             f.write("# sounddevice  name  -- run --ls-snd to list available sound devices\n")
-            f.write("\n# Manual tuning (Auto/Manual toggle) -- last state, restored at startup\n")
+            f.write("\n# Manual tuning (Auto/Manual toggle) -- last state, restored at startup.\n")
+            f.write("# Auto and Manual each remember their own last-used Mode combo selection\n")
+            f.write("# separately (auto_mode/manual_mode) -- switching between them, or\n")
+            f.write("# restarting, always resumes each one right where it was left.\n")
             f.write("manual_active   false\n")
             f.write("manual_freq_khz %s\n" % BAND_DEFAULT_KHZ['40m'])
             f.write("manual_band     40m\n")
-            f.write("manual_mode     FDV1\n")
+            f.write("manual_mode     SSB\n")
+            f.write("auto_mode       FDV1\n")
             f.write("zoom_span_khz   50\n")
             f.write("zoom_steps_khz  %s\n" % ','.join(str(int(s)) for s in DEFAULT_ZOOM_STEPS_KHZ))
             f.write("\n# Band combo centers (kHz) -- edit freely, these are just placeholders\n")
@@ -1700,28 +1719,24 @@ class PanadapterApp:
 
         # Manual tuning state -- self._manual is the single global Auto/Manual
         # gate; while True, _on_rigctl_freq/_on_rigctl_mode below are ignored
-        # and Band/Mode/B-W/drag-tune own the frequency instead. The
-        # remembered manual_* values persist to config immediately on change
-        # (like last_sdr) so a short trip back to Auto and forth, or a full
-        # app restart, never loses them.
+        # and Band/drag-tune own the frequency instead (Mode stays live in
+        # both -- see self._auto_mode/self._manual_mode below). The
+        # remembered manual_*/auto_mode values persist to config immediately
+        # on change (like last_sdr) so a short trip back to Auto and forth,
+        # or a full app restart, never loses them.
         # Which source feeds FreeDV's FDV_RX_in sink: 'RX' (real rig, via
         # options.radio_capture_device) or 'SDR' (this panadapter's own
         # audio, via FDV_PAN). Audio-only -- unrelated to _manual above.
         self._rx_source = options.rx_source_mode
         self._manual = options.manual_active
         self._manual_band = options.manual_band
-        self._manual_mode = options.manual_mode
-        if self._manual_mode not in MODE_NAMES:
-            # Migrate a pre-merge config: manual_mode used to hold a raw
-            # sideband ('usb'/'lsb'/'am'), with the filter shape in a
-            # separate now-removed manual_bw key -- neither means anything
-            # as a Mode combo entry any more. Map old sideband values onto
-            # their nearest new preset rather than leaving an invalid
-            # selection the readonly combo can't actually display.
-            fallback = 'AM' if self._manual_mode.lower() == 'am' else 'SSB'
-            logging.info('manual_mode %r from config is not a known Mode preset, using %s instead',
-                         self._manual_mode, fallback)
-            self._manual_mode = fallback
+        # Auto and Manual each remember their own last-used Mode combo
+        # selection independently (auto_mode/manual_mode config keys) -- the
+        # combo itself is one shared widget, but which of these two it's
+        # currently showing/editing depends on self._manual (see _build_ui,
+        # _on_mode_change, _toggle_auto_manual).
+        self._manual_mode = validate_mode_name(options.manual_mode, 'manual_mode', 'SSB')
+        self._auto_mode = validate_mode_name(options.auto_mode, 'auto_mode', 'FDV1')
         self._reverse_sideband = options.reverse_sideband
         self._zoom_span_khz = options.zoom_span_khz
         self._zoom_steps_khz = options.zoom_steps_khz
@@ -1950,9 +1965,12 @@ class PanadapterApp:
         # not a Band pick), Mode stays enabled in both Auto and Manual: it
         # now only selects passband shape (see _on_rigctl_mode), which Auto
         # needs to choose too (e.g. FDV1 vs the narrower FDV2), not a
-        # frequency/sideband decision that only Manual owns.
+        # frequency/sideband decision that only Manual owns. The combo shows
+        # self._auto_mode or self._manual_mode depending on which is
+        # currently active -- _on_mode_change/_toggle_auto_manual keep the
+        # two in sync with it as that switches.
         ttk.Label(top, text='Mode:', style='Control.TLabel').pack(side='left')
-        self._mode_var = tk.StringVar(value=self._manual_mode)
+        self._mode_var = tk.StringVar(value=(self._manual_mode if self._manual else self._auto_mode))
         self._mode_combo = ttk.Combobox(top, textvariable=self._mode_var, state='readonly',
                                          width=6, values=MODE_NAMES)
         self._mode_combo.pack(side='left', padx=(2, 4))
@@ -2364,6 +2382,7 @@ class PanadapterApp:
         if self._manual:
             self._manual = False
             self._auto_btn_var.set('Auto')
+            self._mode_var.set(self._auto_mode)
         else:
             # Carry the current Auto (rigctl-driven) frequency/band into
             # Manual, rather than jumping to wherever Manual was last left --
@@ -2403,6 +2422,7 @@ class PanadapterApp:
                     logging.debug('failed to save manual_freq_khz: %s', e)
             self._manual = True
             self._auto_btn_var.set('Manual')
+            self._mode_var.set(self._manual_mode)
         try:
             save_config_value(self._options.config, 'manual_active', self._manual)
         except Exception as e:
@@ -2478,11 +2498,20 @@ class PanadapterApp:
                 logging.debug('failed to save manual_freq_khz: %s', e)
 
     def _on_mode_change(self, _event):
-        self._manual_mode = self._mode_var.get()
+        # Updates whichever of auto_mode/manual_mode is currently active --
+        # the other one is left untouched, so switching back later still
+        # finds it exactly where it was (see _toggle_auto_manual).
+        selected = self._mode_var.get()
+        if self._manual:
+            self._manual_mode = selected
+            key = 'manual_mode'
+        else:
+            self._auto_mode = selected
+            key = 'auto_mode'
         try:
-            save_config_value(self._options.config, 'manual_mode', self._manual_mode)
+            save_config_value(self._options.config, key, selected)
         except Exception as e:
-            logging.debug('failed to save manual_mode: %s', e)
+            logging.debug('failed to save %s: %s', key, e)
         if self._manual:
             self._apply_manual_passband()
         # Auto mode picks this up on its own next rigctl poll tick
@@ -2566,17 +2595,18 @@ class PanadapterApp:
         if self._manual:
             return   # Manual owns the mode/passband -- ignore FreeDV/rigctl until switched back to Auto
         if mode:
-            # The passband shape comes from the Mode combo (self._manual_mode
-            # -- shared with Manual, see _set_manual_combo_states) rather
-            # than whatever rigctl reports as passband_hz: FreeDV's own
-            # modem passband is a fixed shape regardless of which sideband
-            # the rig happens to be set to for band convention (e.g. LSB
-            # below 10MHz, USB above/on 60m), and different FreeDV modes
-            # need different widths (e.g. FDV1 vs the narrower FDV2) that
-            # rigctl has no way to report anyway. Mode's sideband (which of
-            # LSB/USB to actually demodulate, for every non-AM-family entry)
-            # still comes from hamlib as the source of truth here, same as
-            # always -- only the passband shape is overridden.
+            # The passband shape comes from the Mode combo's Auto-side
+            # selection (self._auto_mode -- tracked separately from Manual's
+            # own self._manual_mode, see _on_mode_change) rather than
+            # whatever rigctl reports as passband_hz: FreeDV's own modem
+            # passband is a fixed shape regardless of which sideband the rig
+            # happens to be set to for band convention (e.g. LSB below
+            # 10MHz, USB above/on 60m), and different FreeDV modes need
+            # different widths (e.g. FDV1 vs the narrower FDV2) that rigctl
+            # has no way to report anyway. Mode's sideband (which of LSB/USB
+            # to actually demodulate, for every non-AM-family entry) still
+            # comes from hamlib as the source of truth here, same as always
+            # -- only the passband shape is overridden.
             if self._options.auto_mode_by_band:
                 # Some rigs (e.g. a plain Hamlib Dummy backend, never given
                 # an explicit SET_MODE) just sit on one fixed mode regardless
@@ -2587,14 +2617,14 @@ class PanadapterApp:
                     current_freq = self._current_freq_khz
                 band = band_for_freq(current_freq) if current_freq is not None else None
                 mode = BAND_DEFAULT_MODE.get(band, mode)
-            if self._manual_mode in MODE_AM_NAMES:
+            if self._auto_mode in MODE_AM_NAMES:
                 # An AM-family Mode selection overrides whatever sideband
                 # rigctl/band convention gave, same as Manual's
                 # _effective_demod -- AM has no sideband of its own.
                 mode = 'am'
             elif self._reverse_sideband and mode.lower() in ('usb', 'lsb'):
                 mode = 'lsb' if mode.lower() == 'usb' else 'usb'
-            lowcut_hz, highcut_hz = self._compute_bw_passband(mode, self._manual_mode)
+            lowcut_hz, highcut_hz = self._compute_bw_passband(mode, self._auto_mode)
             self._pb_lowcut_hz = lowcut_hz
             self._pb_highcut_hz = highcut_hz
             if self._audio_stream is not None:
@@ -3180,9 +3210,13 @@ def parse_args():
                     help='last/initial Manual-mode frequency in kHz (config: manual_freq_khz)')
     p.add_argument('--manual-band', dest='manual_band', default=cfg.get('manual_band', '40m'),
                     choices=BAND_NAMES, help='last/initial Band combo selection (config: manual_band)')
-    p.add_argument('--manual-mode', dest='manual_mode', default=cfg.get('manual_mode', 'FDV1'),
-                    help='last/initial Mode combo selection -- one of %s (config: manual_mode)'
-                         % ','.join(MODE_NAMES))
+    p.add_argument('--manual-mode', dest='manual_mode', default=cfg.get('manual_mode', 'SSB'),
+                    help='last/initial Mode combo selection while in Manual -- one of %s '
+                         '(config: manual_mode)' % ','.join(MODE_NAMES))
+    p.add_argument('--auto-mode', dest='auto_mode', default=cfg.get('auto_mode', 'FDV1'),
+                    help='last/initial Mode combo selection while in Auto -- tracked separately '
+                         'from --manual-mode so switching between Auto/Manual never loses either '
+                         "one's own last selection (config: auto_mode)")
     p.add_argument('--zoom-span', dest='zoom_span_khz', type=float,
                     default=cfg.get('zoom_span_khz', cfg.get('span_khz', 50.0)),
                     help='last/initial Zoom combo span in kHz, used in both Auto and Manual '

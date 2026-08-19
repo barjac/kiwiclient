@@ -65,11 +65,15 @@ ncomp           true
 modulation      usb
 # sounddevice  name  -- run --ls-snd to list available sound devices
 
-# Manual tuning (Auto/Manual toggle) -- last state, restored at startup
+# Manual tuning (Auto/Manual toggle) -- last state, restored at startup.
+# Auto and Manual each remember their own last-used Mode combo selection
+# separately (auto_mode/manual_mode) -- switching between them, or
+# restarting, always resumes each one right where it was left.
 manual_active   false
 manual_freq_khz 7100.0
 manual_band     40m
 manual_mode     SSB
+auto_mode       FDV1
 zoom_span_khz   50
 zoom_steps_khz  250,100,50,20,10
 
