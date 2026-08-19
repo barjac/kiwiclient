@@ -94,7 +94,7 @@ band_160m_khz 1900.0
 # FDV2 here for a narrower FreeDV mode than FDV1's default width.
 
 bw_fdv1_center_hz  1500.0
-bw_fdv1_width_hz   2400.0
+bw_fdv1_width_hz   1600.0
 
 bw_fdv2_center_hz  1500.0
 bw_fdv2_width_hz   1000.0

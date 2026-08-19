@@ -269,8 +269,11 @@ def band_for_freq(freq_khz):
 # so only width_hz matters); every other entry demods as USB/LSB, resolved
 # live from the tuned band's convention (BAND_DEFAULT_MODE) and optionally
 # flipped by the "reverse sideband" checkbox -- never stored in the combo
-# itself. 'FDV1' defaults match the existing smeter_passband_* defaults;
-# 'FDV2' is a narrower FreeDV variant (e.g. the narrower digital modes);
+# itself. 'FDV1' defaults to 1500/1600 -- the actual FreeDV passband this
+# has always used in real use (matches smeter_passband_center_hz/
+# smeter_passband_bw_hz in panadapter.conf.example, not this file's own
+# generic --smeter-passband-bw CLI default of 2400); 'FDV2' is a narrower
+# FreeDV variant (e.g. the narrower digital modes);
 # 'CW' defaults to a narrow filter around a typical sidetone pitch;
 # 'SSBN'/'SSBW' are narrow/wide SSB alternatives to 'SSB'; 'AMN'/'AM'/'AMW'
 # are narrow/normal/wide AM alternatives, spaced like a typical rig's AM
@@ -280,7 +283,7 @@ def band_for_freq(freq_khz):
 MODE_NAMES = ['FDV1', 'FDV2', 'SSB', 'SSBN', 'SSBW', 'AM', 'AMN', 'AMW', 'CW']
 MODE_AM_NAMES = {'AM', 'AMN', 'AMW'}
 BW_DEFAULT_HZ = {
-    'FDV1': (1500.0, 2400.0),
+    'FDV1': (1500.0, 1600.0),
     'FDV2': (1500.0, 1000.0),
     'SSB': (1500.0, 3000.0),
     'SSBN': (1200.0, 2400.0),
