@@ -269,16 +269,18 @@ def band_for_freq(freq_khz):
 # so only width_hz matters); every other entry demods as USB/LSB, resolved
 # live from the tuned band's convention (BAND_DEFAULT_MODE) and optionally
 # flipped by the "reverse sideband" checkbox -- never stored in the combo
-# itself. 'FDV' defaults match the existing smeter_passband_* defaults;
+# itself. 'FDV1' defaults match the existing smeter_passband_* defaults;
 # 'FDV2' is a narrower FreeDV variant (e.g. the narrower digital modes);
 # 'CW' defaults to a narrow filter around a typical sidetone pitch;
 # 'SSBN'/'SSBW' are narrow/wide SSB alternatives to 'SSB'; 'AMN'/'AM'/'AMW'
 # are narrow/normal/wide AM alternatives, spaced like a typical rig's AM
 # filter set (narrow for crowded conditions, wide for higher fidelity).
-MODE_NAMES = ['FDV', 'FDV2', 'SSB', 'SSBN', 'SSBW', 'AM', 'AMN', 'AMW', 'CW']
+# Auto mode uses whichever entry is currently selected here too (see
+# _on_rigctl_mode) -- it's no longer locked to a fixed hardcoded shape.
+MODE_NAMES = ['FDV1', 'FDV2', 'SSB', 'SSBN', 'SSBW', 'AM', 'AMN', 'AMW', 'CW']
 MODE_AM_NAMES = {'AM', 'AMN', 'AMW'}
 BW_DEFAULT_HZ = {
-    'FDV': (1500.0, 2400.0),
+    'FDV1': (1500.0, 2400.0),
     'FDV2': (1500.0, 1000.0),
     'SSB': (1500.0, 3000.0),
     'SSBN': (1200.0, 2400.0),
@@ -579,7 +581,7 @@ def load_config(path):
             f.write("manual_active   false\n")
             f.write("manual_freq_khz %s\n" % BAND_DEFAULT_KHZ['40m'])
             f.write("manual_band     40m\n")
-            f.write("manual_mode     FDV\n")
+            f.write("manual_mode     FDV1\n")
             f.write("zoom_span_khz   50\n")
             f.write("zoom_steps_khz  %s\n" % ','.join(str(int(s)) for s in DEFAULT_ZOOM_STEPS_KHZ))
             f.write("\n# Band combo centers (kHz) -- edit freely, these are just placeholders\n")
@@ -1941,9 +1943,14 @@ class PanadapterApp:
         self._band_combo.pack(side='left', padx=(2, 4))
         self._band_combo.bind('<<ComboboxSelected>>', self._on_band_change)
 
+        # Unlike Band (Manual-only -- Auto's frequency comes from rigctl,
+        # not a Band pick), Mode stays enabled in both Auto and Manual: it
+        # now only selects passband shape (see _on_rigctl_mode), which Auto
+        # needs to choose too (e.g. FDV1 vs the narrower FDV2), not a
+        # frequency/sideband decision that only Manual owns.
         ttk.Label(top, text='Mode:', style='Control.TLabel').pack(side='left')
         self._mode_var = tk.StringVar(value=self._manual_mode)
-        self._mode_combo = ttk.Combobox(top, textvariable=self._mode_var, state=manual_combo_state,
+        self._mode_combo = ttk.Combobox(top, textvariable=self._mode_var, state='readonly',
                                          width=6, values=MODE_NAMES)
         self._mode_combo.pack(side='left', padx=(2, 4))
         self._mode_combo.bind('<<ComboboxSelected>>', self._on_mode_change)
@@ -2330,11 +2337,10 @@ class PanadapterApp:
         return ('%d kHz' % round(actual_khz))
 
     def _set_manual_combo_states(self, manual):
-        # The reverse-sideband checkbox deliberately isn't gated here --
-        # it's meaningful (and applied) in both Auto and Manual.
-        state = 'readonly' if manual else 'disabled'
-        self._band_combo.config(state=state)
-        self._mode_combo.config(state=state)
+        # Only Band is gated by Auto/Manual -- Mode and the reverse-sideband
+        # checkbox both stay enabled in either (see their own build-time
+        # comments in _build_ui for why).
+        self._band_combo.config(state=('readonly' if manual else 'disabled'))
 
     def _toggle_rx_source(self):
         new_mode = 'SDR' if self._rx_source == 'RX' else 'RX'
@@ -2476,6 +2482,10 @@ class PanadapterApp:
             logging.debug('failed to save manual_mode: %s', e)
         if self._manual:
             self._apply_manual_passband()
+        # Auto mode picks this up on its own next rigctl poll tick
+        # (_on_rigctl_mode, RigctlPoller's own 0.5s cadence), same as
+        # _on_reverse_sideband_change below -- no explicit re-apply needed
+        # here for that case.
 
     def _on_reverse_sideband_change(self):
         self._reverse_sideband = self._reverse_sideband_var.get()
@@ -2553,15 +2563,17 @@ class PanadapterApp:
         if self._manual:
             return   # Manual owns the mode/passband -- ignore FreeDV/rigctl until switched back to Auto
         if mode:
-            # FreeDV's own modem passband is a fixed shape regardless of
-            # which sideband the rig happens to be set to for band
-            # convention (e.g. LSB below 10MHz, USB above/on 60m) -- for now
-            # (2026-08-07, explicit instruction, may revisit), always use the
-            # FreeDV B/W preset's center/width here rather than whatever
-            # rigctl reports as passband_hz, irrespective of USB/LSB. Mode
-            # itself (which sideband to actually demodulate) still comes
-            # from hamlib as the source of truth -- only the passband shape
-            # is overridden.
+            # The passband shape comes from the Mode combo (self._manual_mode
+            # -- shared with Manual, see _set_manual_combo_states) rather
+            # than whatever rigctl reports as passband_hz: FreeDV's own
+            # modem passband is a fixed shape regardless of which sideband
+            # the rig happens to be set to for band convention (e.g. LSB
+            # below 10MHz, USB above/on 60m), and different FreeDV modes
+            # need different widths (e.g. FDV1 vs the narrower FDV2) that
+            # rigctl has no way to report anyway. Mode's sideband (which of
+            # LSB/USB to actually demodulate, for every non-AM-family entry)
+            # still comes from hamlib as the source of truth here, same as
+            # always -- only the passband shape is overridden.
             if self._options.auto_mode_by_band:
                 # Some rigs (e.g. a plain Hamlib Dummy backend, never given
                 # an explicit SET_MODE) just sit on one fixed mode regardless
@@ -2572,9 +2584,14 @@ class PanadapterApp:
                     current_freq = self._current_freq_khz
                 band = band_for_freq(current_freq) if current_freq is not None else None
                 mode = BAND_DEFAULT_MODE.get(band, mode)
-            if self._reverse_sideband and mode.lower() in ('usb', 'lsb'):
+            if self._manual_mode in MODE_AM_NAMES:
+                # An AM-family Mode selection overrides whatever sideband
+                # rigctl/band convention gave, same as Manual's
+                # _effective_demod -- AM has no sideband of its own.
+                mode = 'am'
+            elif self._reverse_sideband and mode.lower() in ('usb', 'lsb'):
                 mode = 'lsb' if mode.lower() == 'usb' else 'usb'
-            lowcut_hz, highcut_hz = self._compute_bw_passband(mode, 'FDV')
+            lowcut_hz, highcut_hz = self._compute_bw_passband(mode, self._manual_mode)
             self._pb_lowcut_hz = lowcut_hz
             self._pb_highcut_hz = highcut_hz
             if self._audio_stream is not None:
@@ -3160,7 +3177,7 @@ def parse_args():
                     help='last/initial Manual-mode frequency in kHz (config: manual_freq_khz)')
     p.add_argument('--manual-band', dest='manual_band', default=cfg.get('manual_band', '40m'),
                     choices=BAND_NAMES, help='last/initial Band combo selection (config: manual_band)')
-    p.add_argument('--manual-mode', dest='manual_mode', default=cfg.get('manual_mode', 'FDV'),
+    p.add_argument('--manual-mode', dest='manual_mode', default=cfg.get('manual_mode', 'FDV1'),
                     help='last/initial Mode combo selection -- one of %s (config: manual_mode)'
                          % ','.join(MODE_NAMES))
     p.add_argument('--zoom-span', dest='zoom_span_khz', type=float,

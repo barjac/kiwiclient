@@ -86,13 +86,15 @@ band_80m_khz 3700.0
 band_160m_khz 1900.0
 
 # Mode combo passband presets (Hz) -- Mode itself no longer carries a
-# sideband selection (see reverse_sideband above); FDV/FDV2/SSB/SSBN/SSBW/CW
+# sideband selection (see reverse_sideband above); FDV1/FDV2/SSB/SSBN/SSBW/CW
 # all resolve USB/LSB live from band convention, AM/AMN/AMW always demod as AM
 # (their center_hz is unused -- lowcut is forced to -highcut regardless, so
-# width_hz alone gives e.g. AMW's +/-6kHz).
+# width_hz alone gives e.g. AMW's +/-6kHz). Auto mode now uses whichever of
+# these is currently selected too, not a fixed hardcoded shape -- e.g. pick
+# FDV2 here for a narrower FreeDV mode than FDV1's default width.
 
-bw_fdv_center_hz  1500.0
-bw_fdv_width_hz   2400.0
+bw_fdv1_center_hz  1500.0
+bw_fdv1_width_hz   2400.0
 
 bw_fdv2_center_hz  1500.0
 bw_fdv2_width_hz   1000.0
