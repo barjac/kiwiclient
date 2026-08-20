@@ -43,6 +43,12 @@ try:
 except ImportError:
     HAS_RESAMPLER = False
 
+HAS_XLIB = True
+try:
+    from Xlib import display as xlib_display
+except ImportError:
+    HAS_XLIB = False
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SDR_LIST = os.path.join(SCRIPT_DIR, 'sdr_list.txt')
 DEFAULT_CONFIG = os.path.join(SCRIPT_DIR, 'panadapter.conf')
@@ -69,6 +75,11 @@ SNAP_POLL_MS = 3000  # how often to re-check the snap-target window's geometry (
                       # deliberately not fast: the use case (another app's window growing/shrinking
                       # as content is added) has no need for frame-perfect tracking, just needs to
                       # eventually catch up.
+SNAP_TOP_OVERLAP_PX = 2  # tuck this many pixels up under the snap target's reported bottom edge --
+                          # live-observed a few pixels of visible gap between the two even with a
+                          # target window that had a fully settled, unchanging geometry, so it isn't
+                          # just poll staleness -- a couple of pixels of deliberate overlap costs
+                          # nothing (target's own rendering just covers this window's very top edge).
 STREAM_STALE_TIMEOUT_SEC = 10.0  # how long a stream can go without delivering any actual
                                   # data before it's treated as dead and reconnected -- a TCP
                                   # socket can stay open (run_event still set, _poll_reconnect's
@@ -584,9 +595,9 @@ def load_config(path):
             f.write("# same band-convention lookup) -- an escape hatch for the rare occasion the\n")
             f.write("# conventional sideband isn't what's wanted.\n")
             f.write("reverse_sideband  false\n")
-            f.write("# Remove this window's titlebar (saves vertical space) -- also drops it from\n")
-            f.write("# the taskbar/Alt+Tab and disables WM dragging entirely. Implied by\n")
-            f.write("# snap_below_title below whenever that's set.\n")
+            f.write("# Remove this window's titlebar (saves vertical space, needs python-xlib) --\n")
+            f.write("# stays fully window-manager-managed, just has no titlebar left to drag by.\n")
+            f.write("# Implied by snap_below_title below whenever that's set.\n")
             f.write("hide_titlebar  false\n")
             f.write("# Continuously reposition below the first window whose title contains this,\n")
             f.write("# spanning full screen width and filling down to the screen bottom. Unset\n")
@@ -740,6 +751,58 @@ _XWININFO_ID_RE = re.compile(r'^\s*(0x[0-9a-fA-F]+)\s+"([^"]*)"')
 _XWININFO_GEOM_RE = re.compile(
     r'Absolute upper-left X:\s*(-?\d+).*?Absolute upper-left Y:\s*(-?\d+).*?'
     r'Width:\s*(\d+).*?Height:\s*(\d+)', re.DOTALL)
+
+
+def _remove_titlebar(root_tk):
+    """Strip this window's titlebar/border by setting _MOTIF_WM_HINTS --
+    the same mechanism KDE's own per-window "No titlebar and frame" rule
+    uses -- rather than Tk's overrideredirect(). overrideredirect() pulls
+    the window entirely out of the WM's normal management, which was
+    live-observed under KWin/Plasma Wayland to break an auto-hide taskbar's
+    own reveal-on-top behavior (both end up fighting over an always-above
+    compositor layer, the panel only briefly/partially showing before
+    getting covered again). Motif hints keep the window fully WM-managed
+    -- normal stacking, still in the taskbar/Alt+Tab, the auto-hide panel
+    reveals correctly over it -- and only strip the visual chrome. Needs
+    python-xlib (a separate raw X11 connection from Tk's own Tcl/Tk one);
+    logs a warning and leaves the titlebar in place if that's not
+    installed, rather than falling back to overrideredirect's known-broken
+    behavior for this use case."""
+    if not HAS_XLIB:
+        logging.warning('hide_titlebar/snap_below_title requested but python-xlib is not installed -- '
+                         'titlebar will not be removed (pip install python-xlib)')
+        return
+    try:
+        disp = xlib_display.Display()
+        try:
+            # winfo_id() is NOT the window the WM actually manages/decorates
+            # on this Tk build -- live-verified via xwininfo -tree: Tk
+            # inserts its own internal wrapper window as the real top-level
+            # (carries WM_NAME/WM_CLASS, is what xwininfo/the WM see as
+            # "the" window) and winfo_id() returns an unnamed *child* of
+            # that instead. Setting the hint there is silently ineffective
+            # (readable back fine on our own connection, but the WM never
+            # sees it since it isn't watching that window). Walk up the
+            # parent chain to the true top-level -- the window whose parent
+            # is the root -- regardless of how many wrapper layers sit
+            # below it.
+            root_id = disp.screen().root.id
+            window = disp.create_resource_object('window', root_tk.winfo_id())
+            while True:
+                parent = window.query_tree().parent
+                if parent.id == root_id:
+                    break
+                window = parent
+            motif_hints = disp.intern_atom('_MOTIF_WM_HINTS')
+            # 5 x CARD32: flags, functions, decorations, input_mode, status.
+            # flags=2 (MWM_HINTS_DECORATIONS is the only field being set),
+            # decorations=0 (none) -- functions/input_mode/status unused here.
+            window.change_property(motif_hints, motif_hints, 32, [2, 0, 0, 0, 0])
+            disp.sync()
+        finally:
+            disp.close()
+    except Exception as e:
+        logging.warning('failed to remove titlebar via _MOTIF_WM_HINTS: %s', e)
 
 
 def _find_window_id(title_substr):
@@ -1932,20 +1995,31 @@ class PanadapterApp:
             self._root.geometry('+%d+%d' % (target_x - error_x, target_y - error_y))
 
     def _build_ui(self):
-        if self._options.hide_titlebar or self._options.snap_below_title:
-            # snap_below_title implies this: there'd be no way to tell a
-            # user-owned titlebar apart from this window's own fully-
-            # automatic positioning otherwise. Set before the first
-            # geometry()/map, not after -- toggling overrideredirect on an
-            # already-mapped window is a known source of WM-specific
-            # remap glitches (window briefly vanishing, needing a manual
-            # refresh) on some WM/Tk combinations.
-            self._root.overrideredirect(True)
+        hiding_titlebar = self._options.hide_titlebar or self._options.snap_below_title
+        if hiding_titlebar:
+            # withdraw() first -- the WM only reads _MOTIF_WM_HINTS when a
+            # window is first mapped, so setting it after that point (a
+            # plain, already-mapped root) was live-verified to be silently
+            # ineffective (titlebar stays, even though the property itself
+            # is correctly set and readable). Set the real geometry now
+            # too, still withdrawn, so the eventual deiconify() below maps
+            # it directly at its final position/size instead of flashing
+            # at some default one first.
+            self._root.withdraw()
         screen_w = self._root.winfo_screenwidth()
         geometry = '%dx%d' % (screen_w, self._options.window_height)
         if self._options.window_x is not None and self._options.window_y is not None:
             geometry += '+%d+%d' % (self._options.window_x, self._options.window_y)
         self._root.geometry(geometry)
+        if hiding_titlebar:
+            # snap_below_title implies hiding the titlebar too -- there'd
+            # be no way to tell a user-owned titlebar apart from this
+            # window's own fully-automatic positioning otherwise.
+            # update_idletasks() forces the window to exist as an X
+            # resource without actually mapping it yet (still withdrawn).
+            self._root.update_idletasks()
+            _remove_titlebar(self._root)
+            self._root.deiconify()
         if self._options.window_x is not None and self._options.window_y is not None:
             self._correct_window_position(self._options.window_x, self._options.window_y)
 
@@ -3002,7 +3076,7 @@ class PanadapterApp:
                 _target_x, target_y, _target_w, target_h = geom
                 screen_w = self._root.winfo_screenwidth()
                 screen_h = self._root.winfo_screenheight()
-                new_y = target_y + target_h
+                new_y = target_y + target_h - SNAP_TOP_OVERLAP_PX
                 # Leave a small strip of the true screen edge uncovered --
                 # otherwise this window sits exactly on top of the one
                 # pixel row an auto-hide taskbar needs the mouse to reach
@@ -3290,10 +3364,11 @@ def parse_args():
                          'conventional sideband isn\'t what\'s wanted (config: reverse_sideband, default false)')
     p.add_argument('--hide-titlebar', dest='hide_titlebar', action='store_true',
                     default=cfg.get('hide_titlebar', False),
-                    help='remove this window\'s titlebar/border (Tk overrideredirect) to save '
-                         'vertical space -- also drops it from the taskbar/Alt+Tab and disables '
-                         'window-manager dragging entirely, so there\'s no way to reposition it '
-                         'except editing window_x/window_y directly, or via --snap-below-title '
+                    help='remove this window\'s titlebar/border (via _MOTIF_WM_HINTS, needs '
+                         'python-xlib) to save vertical space -- stays fully window-manager-'
+                         'managed (taskbar/Alt+Tab, stacking all unaffected), it just has no '
+                         'titlebar left to drag by, so there\'s no way to reposition it except '
+                         'editing window_x/window_y directly, or via --snap-below-title '
                          '(config: hide_titlebar, default false)')
     p.add_argument('--snap-below-title', dest='snap_below_title', default=cfg.get('snap_below_title', ''),
                     help='continuously reposition this window directly below the first window whose '

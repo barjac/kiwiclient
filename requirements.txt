@@ -8,3 +8,7 @@
 # pip (e.g. `urpmi python3-tkinter` / `python3-tk` depending on distro).
 numpy
 soundcard
+# Only needed for kiwipanadapter.py's hide_titlebar/snap_below_title config
+# options (removes the window's titlebar via _MOTIF_WM_HINTS) -- everything
+# else in this file works fine without it.
+python-xlib
