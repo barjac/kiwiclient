@@ -1628,9 +1628,21 @@ class _Tooltip:
         y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
         self._tip = tk.Toplevel(self._widget)
         self._tip.wm_overrideredirect(True)
-        self._tip.wm_geometry('+%d+%d' % (x, y))
         tk.Label(self._tip, text=self._text_fn(), background='#ffffe0', relief='solid',
                  borderwidth=1, font=('TkDefaultFont', 8)).pack(ipadx=4, ipady=2)
+        # Keep the tooltip fully on-screen -- a widget packed hard against
+        # the window's right edge (e.g. the SDR trim buttons) would
+        # otherwise open a tooltip that runs off the screen and gets
+        # truncated, since this is an undecorated override-redirect
+        # Toplevel with no window manager to clip/reposition it. Measure
+        # the actual rendered width (needs the label already packed above)
+        # and clamp x so the tooltip's right edge never passes the screen.
+        self._tip.update_idletasks()
+        screen_w = self._widget.winfo_screenwidth()
+        tip_w = self._tip.winfo_reqwidth()
+        if x + tip_w > screen_w:
+            x = max(0, screen_w - tip_w)
+        self._tip.wm_geometry('+%d+%d' % (x, y))
 
     def _hide(self):
         if self._tip is not None:
