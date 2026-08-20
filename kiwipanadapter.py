@@ -1836,12 +1836,35 @@ class PanadapterApp:
         self._poll_queue()
         self._poll_reconnect()
 
+    def _correct_window_position(self, target_x, target_y):
+        """Some window managers (observed: KWin/XWayland under Plasma
+        Wayland) render a requested self._root.geometry('+x+y') a title
+        bar's height lower than asked -- ICCCM's default NorthWest gravity
+        is supposed to keep the client's own top-left fixed with the WM's
+        decoration extending outward from it, but this WM instead offsets
+        the client by the decoration height on top of the requested
+        position. Since _on_close() saves back whatever winfo_x/y report,
+        and that's the same (accurate) position the window actually
+        rendered at, this was otherwise invisible -- it just looks like a
+        correctly-saved position that's wrong. Measure the real error once,
+        live, and correct for it, rather than hardcoding a decoration-
+        height guess that would only be right for one theme/WM."""
+        self._root.update()   # let the WM finish reparenting/decorating before measuring
+        actual_x, actual_y = self._root.winfo_x(), self._root.winfo_y()
+        error_x, error_y = actual_x - target_x, actual_y - target_y
+        if error_x or error_y:
+            logging.debug('window position landed %+d,%+d off target (%d,%d) -- correcting',
+                          error_x, error_y, target_x, target_y)
+            self._root.geometry('+%d+%d' % (target_x - error_x, target_y - error_y))
+
     def _build_ui(self):
         screen_w = self._root.winfo_screenwidth()
         geometry = '%dx%d' % (screen_w, self._options.window_height)
         if self._options.window_x is not None and self._options.window_y is not None:
             geometry += '+%d+%d' % (self._options.window_x, self._options.window_y)
         self._root.geometry(geometry)
+        if self._options.window_x is not None and self._options.window_y is not None:
+            self._correct_window_position(self._options.window_x, self._options.window_y)
 
         # Fixed-height widgets (top control bar, S-meter bar, freq-axis bar)
         # must be packed to their side *before* the expanding waterfall
@@ -2026,6 +2049,17 @@ class PanadapterApp:
         self._canvas.bind('<ButtonPress-1>', self._on_wf_press)
         self._canvas.bind('<B1-Motion>', self._on_wf_drag)
         self._canvas.bind('<ButtonRelease-1>', self._on_wf_release)
+
+        # Save window geometry live (debounced), not only at clean exit --
+        # a launcher (freedv-start) closing this process via a desktop-icon
+        # -launched FreeDV can tear the whole app down through a systemd/DE
+        # session scope that follows SIGTERM with SIGKILL fast enough that
+        # _on_close() never gets to run (or doesn't finish) -- a race a
+        # plain terminal-launched process never hits. Saving proactively
+        # while the window is open sidesteps needing a clean shutdown to
+        # ever actually happen at all.
+        self._geometry_save_after_id = None
+        self._root.bind('<Configure>', self._on_root_configure)
 
     # -- SDR connection management -------------------------------------------------
 
@@ -2830,6 +2864,20 @@ class PanadapterApp:
     def _on_resize(self, _event):
         self._redraw()
 
+    def _on_root_configure(self, _event):
+        if self._geometry_save_after_id is not None:
+            self._root.after_cancel(self._geometry_save_after_id)
+        self._geometry_save_after_id = self._root.after(800, self._save_window_geometry)
+
+    def _save_window_geometry(self):
+        self._geometry_save_after_id = None
+        try:
+            save_config_value(self._options.config, 'window_height', self._root.winfo_height())
+            save_config_value(self._options.config, 'window_x', self._root.winfo_x())
+            save_config_value(self._options.config, 'window_y', self._root.winfo_y())
+        except Exception as e:
+            logging.debug('failed to save window geometry: %s', e)
+
     def _sensitivity_presets(self):
         # Presets are offsets from the configured mindb/maxdb (the "Normal"
         # baseline), not absolute dBm, so they stay sensible regardless of a
@@ -3064,12 +3112,10 @@ class PanadapterApp:
             c.create_text(x + 2, 0, text=label, fill='white', anchor='n', font=('TkFixedFont', 7))
 
     def _on_close(self):
-        try:
-            save_config_value(self._options.config, 'window_height', self._root.winfo_height())
-            save_config_value(self._options.config, 'window_x', self._root.winfo_x())
-            save_config_value(self._options.config, 'window_y', self._root.winfo_y())
-        except Exception as e:
-            logging.debug('failed to save window geometry: %s', e)
+        if self._geometry_save_after_id is not None:
+            self._root.after_cancel(self._geometry_save_after_id)
+            self._geometry_save_after_id = None
+        self._save_window_geometry()
         if self._manual_band:
             # Capture wherever we're sitting on the current band too, not
             # just bands already left mid-session (see _on_band_change).
