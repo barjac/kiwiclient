@@ -54,6 +54,16 @@ reverse_sideband  false
 # auto-hide taskbar's edge-hover trigger stays reachable underneath it.
 snap_bottom_margin_px  4
 
+# Pixels this window tucks up under snap_below_title's target's reported
+# bottom edge, to close the gap between the two. This is WM/decoration/
+# scaling dependent -- different machines needed noticeably different
+# values in testing (2px on one machine; a large negative value on
+# another, where the default already overlapped badly) -- so tune it by
+# eye per-machine: too small (or negative) leaves a visible gap under
+# the target window, too large lets the target's own titlebar/border
+# overlap down onto this window's controls. Negative values are valid.
+snap_top_overlap_px  2
+
 # Additive calibration offset for the computed S-meter reading -- tune
 # against a trusted reference (e.g. a webSDR on the same signal). Default
 # +12dB (2 S-units) since the panadapter's waterfall-derived reading ran

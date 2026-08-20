@@ -75,11 +75,16 @@ SNAP_POLL_MS = 3000  # how often to re-check the snap-target window's geometry (
                       # deliberately not fast: the use case (another app's window growing/shrinking
                       # as content is added) has no need for frame-perfect tracking, just needs to
                       # eventually catch up.
-SNAP_TOP_OVERLAP_PX = 2  # tuck this many pixels up under the snap target's reported bottom edge --
+SNAP_TOP_OVERLAP_PX_DEFAULT = 2  # default for snap_top_overlap_px (config/--snap-top-overlap) --
+                          # tucks this many pixels up under the snap target's reported bottom edge.
                           # live-observed a few pixels of visible gap between the two even with a
                           # target window that had a fully settled, unchanging geometry, so it isn't
-                          # just poll staleness -- a couple of pixels of deliberate overlap costs
-                          # nothing (target's own rendering just covers this window's very top edge).
+                          # just poll staleness -- a small amount of deliberate overlap costs nothing
+                          # (target's own rendering just covers this window's very top edge). Made
+                          # configurable rather than a fixed constant: the actual gap/overlap turned
+                          # out to be WM/decoration/scaling-dependent -- one machine needed a large
+                          # negative value here to stop the target window's own content (titlebar/
+                          # border) from overlapping down onto this window's controls.
 STREAM_STALE_TIMEOUT_SEC = 10.0  # how long a stream can go without delivering any actual
                                   # data before it's treated as dead and reconnected -- a TCP
                                   # socket can stay open (run_event still set, _poll_reconnect's
@@ -380,6 +385,7 @@ CONFIG_SCHEMA = {
     'hide_titlebar': parse_bool,
     'snap_below_title': str,
     'snap_bottom_margin_px': int,
+    'snap_top_overlap_px': int,
     'sdr_freq_offset_hz': float,
     'manual_active': parse_bool,
     'manual_freq_khz': float,
@@ -606,6 +612,11 @@ def load_config(path):
             f.write("# Pixels of screen bottom left uncovered by snap_below_title, so an\n")
             f.write("# auto-hide taskbar's edge-hover trigger stays reachable.\n")
             f.write("snap_bottom_margin_px  4\n")
+            f.write("# Pixels this window tucks up under snap_below_title's target's reported\n")
+            f.write("# bottom edge -- machine/theme/scaling dependent, tune by eye: too small\n")
+            f.write("# leaves a visible gap, too large lets the target's own titlebar/border\n")
+            f.write("# overlap down onto this window's controls.\n")
+            f.write("snap_top_overlap_px  %d\n" % SNAP_TOP_OVERLAP_PX_DEFAULT)
             f.write("# Calibration trim (Hz) added to the SDR's actual tuned frequency only --\n")
             f.write("# corrects a fixed audio-tone offset FreeDV hears, e.g. Kiwi clock error.\n")
             f.write("# Adjustable live via the </> buttons either side of the freq readout.\n")
@@ -3076,7 +3087,7 @@ class PanadapterApp:
                 _target_x, target_y, _target_w, target_h = geom
                 screen_w = self._root.winfo_screenwidth()
                 screen_h = self._root.winfo_screenheight()
-                new_y = target_y + target_h - SNAP_TOP_OVERLAP_PX
+                new_y = target_y + target_h - self._options.snap_top_overlap_px
                 # Leave a small strip of the true screen edge uncovered --
                 # otherwise this window sits exactly on top of the one
                 # pixel row an auto-hide taskbar needs the mouse to reach
@@ -3385,6 +3396,16 @@ def parse_args():
                          'auto-hide taskbar\'s edge-hover trigger stays reachable -- this window '
                          'would otherwise cover the exact bottom pixel row the taskbar needs the '
                          'mouse to reach (config: snap_bottom_margin_px, default 4)')
+    p.add_argument('--snap-top-overlap', dest='snap_top_overlap_px', type=int,
+                    default=cfg.get('snap_top_overlap_px', SNAP_TOP_OVERLAP_PX_DEFAULT),
+                    help='pixels this window tucks up under --snap-below-title\'s target\'s reported '
+                         'bottom edge -- the WM-reported edge and the true visible edge of another '
+                         'app\'s window don\'t always agree exactly, so this is machine/theme/scaling '
+                         'dependent: too small (or negative) leaves a visible gap, too large lets the '
+                         'target\'s own titlebar/border overlap down onto this window\'s controls -- '
+                         'negative values are valid and just widen the gap further, useful if the '
+                         'default already overlaps badly on a given machine (config: '
+                         'snap_top_overlap_px, default %d)' % SNAP_TOP_OVERLAP_PX_DEFAULT)
     p.add_argument('--sdr-freq-offset', dest='sdr_freq_offset_hz', type=float,
                     default=cfg.get('sdr_freq_offset_hz', 0.0),
                     help='calibration trim in Hz added to the SDR\'s actual tuned frequency only '
