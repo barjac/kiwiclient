@@ -21,6 +21,7 @@ import math
 import os
 import queue
 import re
+import signal
 import socket
 import subprocess
 import threading
@@ -3275,7 +3276,24 @@ def main():
     logging.basicConfig(level=logging.getLevelName(options.log_level.upper()),
                          format='%(asctime)-15s %(message)s')
     root = tk.Tk()
-    PanadapterApp(root, options)
+    app = PanadapterApp(root, options)
+
+    def _handle_shutdown_signal(signum, _frame):
+        # Launchers (freedv-start/freedv-start-leno) tear this process down
+        # with a plain 'kill -s QUIT' once FreeDV exits, rather than closing
+        # the window -- that bypasses WM_DELETE_WINDOW entirely, and
+        # SIGTERM/SIGQUIT's default disposition is immediate termination
+        # with no Python-level cleanup, silently skipping _on_close()'s save
+        # of window position/height and the current band's last frequency
+        # every single time. Handle both explicitly and run the exact same
+        # shutdown path instead. Safe to call mid-mainloop: Tkinter's own
+        # after() timers (150ms-5s) already return control to Python often
+        # enough for the interpreter to notice and run this promptly.
+        logging.info('received signal %d, shutting down', signum)
+        app._on_close()
+
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGQUIT, _handle_shutdown_signal)
     root.mainloop()
 
 
