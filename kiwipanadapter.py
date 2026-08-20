@@ -65,6 +65,10 @@ RIG_STALE_TIMEOUT_SEC = 5.0  # how long without a successful rigctl poll (Auto m
                               # the waterfall just sits on default_freq showing perfectly normal-looking
                               # (but meaningless) data forever, with no on-screen sign anything's wrong.
 FINE_TUNE_STEP_HZ = 5.0  # per-click Manual-mode nudge from the </> fine-tune buttons
+SNAP_POLL_MS = 3000  # how often to re-check the snap-target window's geometry (snap_below_title) --
+                      # deliberately not fast: the use case (another app's window growing/shrinking
+                      # as content is added) has no need for frame-perfect tracking, just needs to
+                      # eventually catch up.
 STREAM_STALE_TIMEOUT_SEC = 10.0  # how long a stream can go without delivering any actual
                                   # data before it's treated as dead and reconnected -- a TCP
                                   # socket can stay open (run_event still set, _poll_reconnect's
@@ -362,6 +366,9 @@ CONFIG_SCHEMA = {
     'ifreq': float,
     'auto_mode_by_band': parse_bool,
     'reverse_sideband': parse_bool,
+    'hide_titlebar': parse_bool,
+    'snap_below_title': str,
+    'snap_bottom_margin_px': int,
     'sdr_freq_offset_hz': float,
     'manual_active': parse_bool,
     'manual_freq_khz': float,
@@ -577,6 +584,17 @@ def load_config(path):
             f.write("# same band-convention lookup) -- an escape hatch for the rare occasion the\n")
             f.write("# conventional sideband isn't what's wanted.\n")
             f.write("reverse_sideband  false\n")
+            f.write("# Remove this window's titlebar (saves vertical space) -- also drops it from\n")
+            f.write("# the taskbar/Alt+Tab and disables WM dragging entirely. Implied by\n")
+            f.write("# snap_below_title below whenever that's set.\n")
+            f.write("hide_titlebar  false\n")
+            f.write("# Continuously reposition below the first window whose title contains this,\n")
+            f.write("# spanning full screen width and filling down to the screen bottom. Unset\n")
+            f.write("# (no line below) disables it -- uncomment and adjust to enable:\n")
+            f.write("# snap_below_title  FreeDV Reporter\n")
+            f.write("# Pixels of screen bottom left uncovered by snap_below_title, so an\n")
+            f.write("# auto-hide taskbar's edge-hover trigger stays reachable.\n")
+            f.write("snap_bottom_margin_px  4\n")
             f.write("# Calibration trim (Hz) added to the SDR's actual tuned frequency only --\n")
             f.write("# corrects a fixed audio-tone offset FreeDV hears, e.g. Kiwi clock error.\n")
             f.write("# Adjustable live via the </> buttons either side of the freq readout.\n")
@@ -716,6 +734,48 @@ def _pw_link_set(src_ports, dst_ports, connect):
             logging.warning('%s raised %s', ' '.join(cmd), e)
             ok = False
     return ok
+
+
+_XWININFO_ID_RE = re.compile(r'^\s*(0x[0-9a-fA-F]+)\s+"([^"]*)"')
+_XWININFO_GEOM_RE = re.compile(
+    r'Absolute upper-left X:\s*(-?\d+).*?Absolute upper-left Y:\s*(-?\d+).*?'
+    r'Width:\s*(\d+).*?Height:\s*(\d+)', re.DOTALL)
+
+
+def _find_window_id(title_substr):
+    """First top-level window whose title contains title_substr (case-
+    sensitive, matching e.g. 'FreeDV Reporter' -- FreeDVReporterDialog's own
+    title, gui/dialogs/freedv_reporter.cpp -- exactly, including any
+    "(configname)" suffix). Returns None if none matches or xwininfo fails.
+    Shells out rather than adding an X11 library dependency (python-xlib
+    etc.) just for this -- consistent with this file's existing PipeWire
+    helpers above, and this only needs to run a few times a minute at most
+    (see SNAP_POLL_MS)."""
+    try:
+        out = subprocess.run(['xwininfo', '-root', '-tree'], capture_output=True, text=True, timeout=2).stdout
+    except Exception as e:
+        logging.debug('xwininfo -tree failed: %s', e)
+        return None
+    for line in out.splitlines():
+        m = _XWININFO_ID_RE.match(line)
+        if m and title_substr in m.group(2):
+            return m.group(1)
+    return None
+
+
+def _get_window_geometry(win_id):
+    """(x, y, width, height) in absolute screen coordinates for an X11
+    window id (as returned by _find_window_id), or None if the window's
+    gone or xwininfo fails."""
+    try:
+        out = subprocess.run(['xwininfo', '-id', win_id], capture_output=True, text=True, timeout=2).stdout
+    except Exception as e:
+        logging.debug('xwininfo -id %s failed: %s', win_id, e)
+        return None
+    m = _XWININFO_GEOM_RE.search(out)
+    if not m:
+        return None
+    return tuple(int(g) for g in m.groups())
 
 
 def _parse_sdr_tokens(parts):
@@ -1847,6 +1907,8 @@ class PanadapterApp:
         root.protocol('WM_DELETE_WINDOW', self._on_close)
         self._poll_queue()
         self._poll_reconnect()
+        if options.snap_below_title:
+            self._poll_snap_target()
 
     def _correct_window_position(self, target_x, target_y):
         """Some window managers (observed: KWin/XWayland under Plasma
@@ -1870,6 +1932,15 @@ class PanadapterApp:
             self._root.geometry('+%d+%d' % (target_x - error_x, target_y - error_y))
 
     def _build_ui(self):
+        if self._options.hide_titlebar or self._options.snap_below_title:
+            # snap_below_title implies this: there'd be no way to tell a
+            # user-owned titlebar apart from this window's own fully-
+            # automatic positioning otherwise. Set before the first
+            # geometry()/map, not after -- toggling overrideredirect on an
+            # already-mapped window is a known source of WM-specific
+            # remap glitches (window briefly vanishing, needing a manual
+            # refresh) on some WM/Tk combinations.
+            self._root.overrideredirect(True)
         screen_w = self._root.winfo_screenwidth()
         geometry = '%dx%d' % (screen_w, self._options.window_height)
         if self._options.window_x is not None and self._options.window_y is not None:
@@ -2072,6 +2143,9 @@ class PanadapterApp:
         # ever actually happen at all.
         self._geometry_save_after_id = None
         self._root.bind('<Configure>', self._on_root_configure)
+
+        self._snap_target_id = None
+        self._snap_last_geom = None
 
     # -- SDR connection management -------------------------------------------------
 
@@ -2885,6 +2959,8 @@ class PanadapterApp:
         self._redraw()
 
     def _on_root_configure(self, _event):
+        if self._options.snap_below_title:
+            return   # position is fully derived/automatic -- nothing user-set to persist
         if self._geometry_save_after_id is not None:
             self._root.after_cancel(self._geometry_save_after_id)
         self._geometry_save_after_id = self._root.after(800, self._save_window_geometry)
@@ -2897,6 +2973,47 @@ class PanadapterApp:
             save_config_value(self._options.config, 'window_y', self._root.winfo_y())
         except Exception as e:
             logging.debug('failed to save window geometry: %s', e)
+
+    def _poll_snap_target(self):
+        """snap_below_title: keep this window glued directly below the
+        first window whose title contains the configured substring (e.g.
+        FreeDV's own Reporter dialog), spanning full screen width and
+        filling down to the screen bottom -- so as that window grows
+        (more stations reported) or shrinks, this one gives up/reclaims
+        exactly the space it needs. Deliberately low-rate (SNAP_POLL_MS)
+        and only re-applies geometry when it's actually changed, both to
+        stay cheap and to avoid fighting a live drag/resize of *this*
+        window if hide_titlebar somehow isn't in effect."""
+        if self._snap_target_id is None:
+            self._snap_target_id = _find_window_id(self._options.snap_below_title)
+            if self._snap_target_id is None:
+                logging.debug('snap_below_title %r: no matching window found (yet)',
+                              self._options.snap_below_title)
+        if self._snap_target_id is not None:
+            geom = _get_window_geometry(self._snap_target_id)
+            if geom is None:
+                # Gone (closed, or was never real) -- drop it and re-search
+                # next tick rather than sitting on a dead id forever.
+                self._snap_target_id = None
+            else:
+                # x/width intentionally ignored -- this window always spans
+                # full screen width regardless of the target's own, matching
+                # its own existing always-full-width design (see _build_ui).
+                _target_x, target_y, _target_w, target_h = geom
+                screen_w = self._root.winfo_screenwidth()
+                screen_h = self._root.winfo_screenheight()
+                new_y = target_y + target_h
+                # Leave a small strip of the true screen edge uncovered --
+                # otherwise this window sits exactly on top of the one
+                # pixel row an auto-hide taskbar needs the mouse to reach
+                # to trigger its own reveal, making it unreachable while
+                # this window is up.
+                new_h = max(60, screen_h - new_y - self._options.snap_bottom_margin_px)
+                new_geom = (screen_w, new_h, new_y)
+                if new_geom != self._snap_last_geom:
+                    self._snap_last_geom = new_geom
+                    self._root.geometry('%dx%d+0+%d' % new_geom)
+        self._root.after(SNAP_POLL_MS, self._poll_snap_target)
 
     def _sensitivity_presets(self):
         # Presets are offsets from the configured mindb/maxdb (the "Normal"
@@ -3171,6 +3288,28 @@ def parse_args():
                     help='flip the band-convention LSB/USB choice used by every SSB-family Mode '
                          'entry, in both Auto and Manual -- an escape hatch for the rare case the '
                          'conventional sideband isn\'t what\'s wanted (config: reverse_sideband, default false)')
+    p.add_argument('--hide-titlebar', dest='hide_titlebar', action='store_true',
+                    default=cfg.get('hide_titlebar', False),
+                    help='remove this window\'s titlebar/border (Tk overrideredirect) to save '
+                         'vertical space -- also drops it from the taskbar/Alt+Tab and disables '
+                         'window-manager dragging entirely, so there\'s no way to reposition it '
+                         'except editing window_x/window_y directly, or via --snap-below-title '
+                         '(config: hide_titlebar, default false)')
+    p.add_argument('--snap-below-title', dest='snap_below_title', default=cfg.get('snap_below_title', ''),
+                    help='continuously reposition this window directly below the first window whose '
+                         'title contains this substring (e.g. "FreeDV Reporter"), spanning full '
+                         'screen width and filling down to the screen bottom -- re-checked every '
+                         '%dms (not fast; the use case is another app\'s window growing/shrinking as '
+                         'content is added, not live dragging). Implies --hide-titlebar (there\'d be '
+                         'no way to tell the two apart otherwise -- the whole point is this window\'s '
+                         'position is fully automatic). Empty (default) disables it (config: '
+                         'snap_below_title)' % SNAP_POLL_MS)
+    p.add_argument('--snap-bottom-margin', dest='snap_bottom_margin_px', type=int,
+                    default=cfg.get('snap_bottom_margin_px', 4),
+                    help='pixels of screen bottom left uncovered by --snap-below-title, so an '
+                         'auto-hide taskbar\'s edge-hover trigger stays reachable -- this window '
+                         'would otherwise cover the exact bottom pixel row the taskbar needs the '
+                         'mouse to reach (config: snap_bottom_margin_px, default 4)')
     p.add_argument('--sdr-freq-offset', dest='sdr_freq_offset_hz', type=float,
                     default=cfg.get('sdr_freq_offset_hz', 0.0),
                     help='calibration trim in Hz added to the SDR\'s actual tuned frequency only '
