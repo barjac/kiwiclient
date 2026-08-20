@@ -1859,12 +1859,17 @@ class PanadapterApp:
         self._style = ttk.Style(self._root)
         style = self._style
         # Flat, like the other control-bar labels (a sunken/bordered box was
-        # tried and looked cluttered in the tight bar). Kept pinned to a
-        # fixed light background rather than tracking the dark-mode tint --
-        # the Buttons/Comboboxes beside it stay at Tk's native (light) look
+        # tried and looked cluttered in the tight bar). Green while actually
+        # streaming data (Connected), amber for every other state
+        # (Connecting/Disconnecting/Stopped) -- same green=good/amber=not-
+        # quite convention as the RX/SDR toggle below. Both pinned to fixed
+        # colors rather than tracking the dark-mode tint -- the
+        # Buttons/Comboboxes beside it stay at Tk's native (light) look
         # regardless of the desktop theme, so a dark status box just clashed
-        # with them instead of reading as "matching the theme".
-        style.configure('Status.TLabel', padding=(4, 1), background='#dce9f5', foreground='#000000')
+        # with them instead of reading as "matching the theme". See
+        # _set_status.
+        style.configure('StatusGreen.TLabel', padding=(4, 1), background='#4caf50', foreground='#000000')
+        style.configure('StatusAmber.TLabel', padding=(4, 1), background='#ffb300', foreground='#000000')
         self._theme_dark = None
         self._apply_control_bar_theme()
         # RX/SDR source toggle: green while FreeDV listens to the real
@@ -1917,7 +1922,9 @@ class PanadapterApp:
         # Fixed width (like the S-meter's dBm label below) so
         # Connecting/Disconnecting/Connected/Stopped text changes don't shift Manage/
         # Stop/Auto/the combos left and right as the status changes.
-        ttk.Label(top, textvariable=self._status_var, width=21, anchor='w', style='Status.TLabel').pack(side='left', padx=2)
+        self._status_label = ttk.Label(top, textvariable=self._status_var, width=21, anchor='w',
+                                        style='StatusAmber.TLabel')
+        self._status_label.pack(side='left', padx=2)
 
         ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left', padx=2)
 
@@ -2077,6 +2084,13 @@ class PanadapterApp:
                 _pw_link_set(radio, rx_in, connect=False)
             return True
 
+    def _set_status(self, text):
+        """Sets the status text and its background -- green for 'Connected'
+        (actually streaming data), amber for everything else (Connecting/
+        Disconnecting/Stopped)."""
+        self._status_var.set(text)
+        self._status_label.configure(style=('StatusGreen.TLabel' if text == 'Connected' else 'StatusAmber.TLabel'))
+
     def _start_stream(self, sdr_entry):
         with self._freq_lock:
             dial_freq = self._current_freq_khz if self._current_freq_khz is not None else self._options.default_freq
@@ -2136,7 +2150,7 @@ class PanadapterApp:
                 if self._audio_stream is not None:
                     self._audio_stream.retune(self._sdr_tune_freq(freq_now))
 
-        self._status_var.set('Connecting')
+        self._set_status('Connecting')
         self._stream_start_ts = time.time()
         if self._manual:
             # A freshly (re)created LiveAudioStream always starts with the
@@ -2294,7 +2308,7 @@ class PanadapterApp:
         # look like it did nothing for a couple of seconds. update_idletasks()
         # alone wasn't enough to force the actual repaint out to the display
         # before the blocking joins below ran; update() forces that.
-        self._status_var.set('Disconnecting')
+        self._set_status('Disconnecting')
         self._root.update()
         self._stop_stream()
         self._reset_display_state()
@@ -2315,8 +2329,8 @@ class PanadapterApp:
             colors = CONTROL_BAR_COLORS['dark' if dark else 'light']
             self._style.configure('Control.TFrame', background=colors['bg'])
             self._style.configure('Control.TLabel', background=colors['bg'], foreground=colors['fg'])
-            # Status.TLabel is deliberately left out here -- pinned to a
-            # fixed light background in _build_ui (see comment there).
+            # StatusGreen/StatusAmber.TLabel are deliberately left out here
+            # -- pinned to fixed colors in _build_ui (see comment there).
         self._root.after(THEME_POLL_MS, self._apply_control_bar_theme)
 
     def _toggle_stream(self):
@@ -2332,7 +2346,7 @@ class PanadapterApp:
             self._stopped = False
             self._stop_btn_var.set('Stop')
         else:
-            self._status_var.set('Disconnecting')
+            self._set_status('Disconnecting')
             self._root.update()
             self._stop_stream()
             self._active_sdr = None
@@ -2341,7 +2355,7 @@ class PanadapterApp:
             self._redraw()
             self._freq_var.set('-- kHz')
             self._dbm_var.set('-- dBm')
-            self._status_var.set('Stopped')
+            self._set_status('Stopped')
             self._stop_btn_var.set('Start')
 
     # -- Auto/Manual toggle + Zoom/Band/Mode/B-W combos -------------------------------
@@ -2713,7 +2727,7 @@ class PanadapterApp:
             pass
 
         if latest is not None:
-            self._status_var.set('Connected')
+            self._set_status('Connected')
             self._freq_var.set('%.3f kHz' % latest['center'])
             self._ingest_row(latest)
             self._redraw()
