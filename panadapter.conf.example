@@ -39,6 +39,21 @@ auto_mode_by_band  true
 # actually wanted.
 reverse_sideband  false
 
+# Remove this window's titlebar (saves vertical space) -- also drops it from
+# the taskbar/Alt+Tab and disables WM dragging entirely. Implied by
+# snap_below_title below whenever that's set.
+# hide_titlebar  true
+
+# Continuously reposition below the first window whose title contains this,
+# spanning full screen width and filling down to the screen bottom -- e.g.
+# to sit directly under FreeDV's own Reporter dialog, growing/shrinking to
+# fill whatever room it leaves. Unset (no line below) disables it.
+# snap_below_title  FreeDV Reporter
+
+# Pixels of screen bottom left uncovered by snap_below_title, so an
+# auto-hide taskbar's edge-hover trigger stays reachable underneath it.
+snap_bottom_margin_px  4
+
 # Additive calibration offset for the computed S-meter reading -- tune
 # against a trusted reference (e.g. a webSDR on the same signal). Default
 # +12dB (2 S-units) since the panadapter's waterfall-derived reading ran
