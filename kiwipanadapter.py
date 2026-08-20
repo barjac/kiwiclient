@@ -1933,8 +1933,11 @@ class PanadapterApp:
 
         # Shows the current state (Auto/Manual), not the click target -- a
         # tooltip spells out the action since the label alone no longer does.
+        # Green/amber same as the status label and RX/SDR toggle -- Auto
+        # (following the rig) is the "normal" green state, Manual amber.
         self._auto_btn_var = tk.StringVar(value=('Manual' if self._manual else 'Auto'))
-        self._auto_btn = ttk.Button(top, textvariable=self._auto_btn_var, command=self._toggle_auto_manual, width=7)
+        self._auto_btn = ttk.Button(top, textvariable=self._auto_btn_var, command=self._toggle_auto_manual,
+                                     width=7, style=('Amber.TButton' if self._manual else 'Green.TButton'))
         self._auto_btn.pack(side='left', padx=2)
         _Tooltip(self._auto_btn, lambda: 'Click to switch to %s' % (
             'Auto' if self._auto_btn_var.get() == 'Manual' else 'Manual'))
@@ -2437,6 +2440,7 @@ class PanadapterApp:
             self._manual = True
             self._auto_btn_var.set('Manual')
             self._mode_var.set(self._manual_mode)
+        self._auto_btn.configure(style=('Amber.TButton' if self._manual else 'Green.TButton'))
         try:
             save_config_value(self._options.config, 'manual_active', self._manual)
         except Exception as e:
