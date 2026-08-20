@@ -852,6 +852,36 @@ def _get_window_geometry(win_id):
     return tuple(int(g) for g in m.groups())
 
 
+_NET_WORKAREA_RE = re.compile(r'_NET_WORKAREA\(CARDINAL\)\s*=\s*(-?\d+),\s*(-?\d+),\s*(\d+),\s*(\d+)')
+
+
+def _get_workarea():
+    """(x, y, width, height) of the current desktop's usable work area --
+    the screen area actually left over once the WM's own panels/docks
+    reserve their strip via _NET_WM_STRUT(_PARTIAL), per the EWMH
+    _NET_WORKAREA root property -- or None if unavailable (xprop missing,
+    or a minimal WM that doesn't set this property at all). This is what
+    snap_below_title should bound itself to instead of raw screen height:
+    a WM whose panel isn't auto-hide (unlike the KWin/Plasma auto-hide
+    taskbar snap_bottom_margin_px was built for, which reports full
+    screen height here since nothing's reserved while hidden) needs this
+    window to actually stop above the panel, not just leave a few spare
+    pixels at the bottom of the raw screen. Only the first (desktop 0)
+    quad is read from the property's per-desktop list -- fine for the
+    single-virtual-desktop kiosk-style setup this runs on; a WM with
+    multiple active desktops of differing work areas would need
+    _NET_CURRENT_DESKTOP cross-referenced too."""
+    try:
+        out = subprocess.run(['xprop', '-root', '_NET_WORKAREA'], capture_output=True, text=True, timeout=2).stdout
+    except Exception as e:
+        logging.debug('xprop _NET_WORKAREA failed: %s', e)
+        return None
+    m = _NET_WORKAREA_RE.search(out)
+    if not m:
+        return None
+    return tuple(int(g) for g in m.groups())
+
+
 def _parse_sdr_tokens(parts):
     """parts: whitespace-split tokens of 'name... host port [mimic_browser] [no_sound]'
     (trailing flags in any order). Returns (name, host, port, mimic_browser,
@@ -2230,7 +2260,6 @@ class PanadapterApp:
         self._root.bind('<Configure>', self._on_root_configure)
 
         self._snap_target_id = None
-        self._snap_last_geom = None
 
     # -- SDR connection management -------------------------------------------------
 
@@ -3063,12 +3092,11 @@ class PanadapterApp:
         """snap_below_title: keep this window glued directly below the
         first window whose title contains the configured substring (e.g.
         FreeDV's own Reporter dialog), spanning full screen width and
-        filling down to the screen bottom -- so as that window grows
-        (more stations reported) or shrinks, this one gives up/reclaims
-        exactly the space it needs. Deliberately low-rate (SNAP_POLL_MS)
-        and only re-applies geometry when it's actually changed, both to
-        stay cheap and to avoid fighting a live drag/resize of *this*
-        window if hide_titlebar somehow isn't in effect."""
+        filling down to the bottom of the usable work area -- so as that
+        window grows (more stations reported) or shrinks, this one gives
+        up/reclaims exactly the space it needs. Deliberately low-rate
+        (SNAP_POLL_MS), re-deriving and re-applying geometry from scratch
+        every tick rather than tracking/diffing against what was last set."""
         if self._snap_target_id is None:
             self._snap_target_id = _find_window_id(self._options.snap_below_title)
             if self._snap_target_id is None:
@@ -3087,17 +3115,31 @@ class PanadapterApp:
                 _target_x, target_y, _target_w, target_h = geom
                 screen_w = self._root.winfo_screenwidth()
                 screen_h = self._root.winfo_screenheight()
+                # Bottom bound: prefer the WM-reported work area (screen
+                # minus whatever it's actually reserved for its own panel/
+                # dock) over raw screen height -- needed on a WM whose
+                # panel isn't auto-hide (so its strip is genuinely
+                # reserved, and this window must actually stop above it),
+                # unlike the KWin/Plasma auto-hide taskbar
+                # snap_bottom_margin_px below was designed for, where
+                # _NET_WORKAREA reports full screen height since nothing's
+                # reserved while the taskbar's hidden. Falls back to raw
+                # screen height if the WM doesn't set the property at all.
+                workarea = _get_workarea()
+                bottom_limit = (workarea[1] + workarea[3]) if workarea is not None else screen_h
                 new_y = target_y + target_h - self._options.snap_top_overlap_px
-                # Leave a small strip of the true screen edge uncovered --
+                # Leave a small strip of the bottom bound uncovered --
                 # otherwise this window sits exactly on top of the one
                 # pixel row an auto-hide taskbar needs the mouse to reach
                 # to trigger its own reveal, making it unreachable while
-                # this window is up.
-                new_h = max(60, screen_h - new_y - self._options.snap_bottom_margin_px)
-                new_geom = (screen_w, new_h, new_y)
-                if new_geom != self._snap_last_geom:
-                    self._snap_last_geom = new_geom
-                    self._root.geometry('%dx%d+0+%d' % new_geom)
+                # this window is up (only relevant when bottom_limit ==
+                # screen_h -- an already-reserved work area has no need for
+                # this, but the small margin is harmless either way).
+                new_h = max(60, bottom_limit - new_y - self._options.snap_bottom_margin_px)
+                # Recomputed and re-applied every tick, not just when it
+                # changed from last time -- both target and work area can
+                # move independently of each other.
+                self._root.geometry('%dx%d+0+%d' % (screen_w, new_h, new_y))
         self._root.after(SNAP_POLL_MS, self._poll_snap_target)
 
     def _sensitivity_presets(self):
