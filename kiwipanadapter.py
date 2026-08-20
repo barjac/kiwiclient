@@ -242,9 +242,9 @@ BAND_DEFAULT_MODE = {
     '30m': 'usb', '40m': 'lsb', '60m': 'usb', '80m': 'lsb', '160m': 'lsb',
 }
 # Approximate amateur band edges (kHz), used only to figure out which Band
-# combo entry a given frequency falls in (self-healing a stale/corrupted
-# manual_band, see _on_band_change) -- not authoritative for any regulatory
-# purpose, just wide enough to cover typical allocations.
+# combo entry a given frequency falls in (see _toggle_auto_manual carrying
+# the current Auto/rigctl frequency into Manual) -- not authoritative for
+# any regulatory purpose, just wide enough to cover typical allocations.
 BAND_RANGES_KHZ = {
     '160m': (1800.0, 2000.0), '80m': (3500.0, 4000.0), '60m': (5330.0, 5410.0),
     '40m': (7000.0, 7300.0), '30m': (10100.0, 10150.0), '20m': (14000.0, 14350.0),
@@ -2379,22 +2379,47 @@ class PanadapterApp:
             logging.debug('failed to save rx_source_mode: %s', e)
 
     def _toggle_auto_manual(self):
-        # Auto and Manual each always resume exactly where they were last
-        # left -- their own last-used frequency/band (manual_freq_khz/
-        # manual_band, restored by _apply_manual_state below; Auto simply
-        # goes back to following rigctl) and their own last-used Mode combo
-        # selection (self._auto_mode/self._manual_mode, see _on_mode_change)
-        # -- rather than one carrying state from the other. (Previously,
-        # switching to Manual carried Auto's current rigctl-driven
-        # frequency/band across, so you could flip over mid-FreeDV-session
-        # to check adjacent frequencies without losing your place -- that
-        # conflicts with always resuming Manual's own last state, so it's
-        # gone for now; see git history to bring it back if it's missed.)
         if self._manual:
             self._manual = False
             self._auto_btn_var.set('Auto')
             self._mode_var.set(self._auto_mode)
         else:
+            # Carry the current Auto (rigctl-driven) frequency/band into
+            # Manual, rather than jumping to wherever Manual was last left --
+            # lets you flip to Manual mid-FreeDV-session to check adjacent
+            # frequencies without losing your place. No equivalent needed
+            # the other way: Auto always reflects wherever the rig currently
+            # is regardless of what Manual was just doing.
+            with self._freq_lock:
+                current_freq = self._current_freq_khz
+            if not is_plausible_freq_khz(current_freq):
+                if current_freq is not None:
+                    logging.warning('not carrying implausible Auto frequency %.3f kHz into Manual', current_freq)
+                current_freq = None
+            if current_freq is not None:
+                detected_band = band_for_freq(current_freq)
+                if detected_band is not None and detected_band != self._manual_band:
+                    # Save the band we're leaving its own last-used frequency
+                    # first, same as _on_band_change does -- otherwise its
+                    # old self._manual_freq_khz value is simply lost/overwritten
+                    # below rather than remembered for a return visit.
+                    self._band_last_freq_khz[self._manual_band] = self._manual_freq_khz
+                    try:
+                        save_config_value(self._options.config,
+                                           'band_%s_last_khz' % self._manual_band, self._manual_freq_khz)
+                    except Exception as e:
+                        logging.debug('failed to save band_%s_last_khz: %s', self._manual_band, e)
+                    self._manual_band = detected_band
+                    self._band_var.set(detected_band)
+                    try:
+                        save_config_value(self._options.config, 'manual_band', detected_band)
+                    except Exception as e:
+                        logging.debug('failed to save manual_band: %s', e)
+                self._manual_freq_khz = current_freq
+                try:
+                    save_config_value(self._options.config, 'manual_freq_khz', current_freq)
+                except Exception as e:
+                    logging.debug('failed to save manual_freq_khz: %s', e)
             self._manual = True
             self._auto_btn_var.set('Manual')
             self._mode_var.set(self._manual_mode)
