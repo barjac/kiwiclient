@@ -2367,6 +2367,14 @@ class PanadapterApp:
             colors = CONTROL_BAR_COLORS['dark' if dark else 'light']
             self._style.configure('Control.TFrame', background=colors['bg'])
             self._style.configure('Control.TLabel', background=colors['bg'], foreground=colors['fg'])
+            # The bar Frames are packed with their own padx/pady margin
+            # (e.g. top.pack(..., padx=4, pady=4)) -- that margin is bare
+            # root window background showing through around the Frame, not
+            # covered by Control.TFrame's own styling at all, so it stayed
+            # the native (light) Tk background on all four sides even once
+            # the Frame itself was correctly tinted. self._root is a plain
+            # tk widget (not ttk), so it takes background directly.
+            self._root.configure(background=colors['bg'])
             # StatusGreen/StatusAmber.TLabel are deliberately left out here
             # -- pinned to fixed colors in _build_ui (see comment there).
         self._root.after(THEME_POLL_MS, self._apply_control_bar_theme)
