@@ -919,7 +919,7 @@ def load_sdr_list(path):
     A whole line starting with '#' that still parses as a valid entry (once
     the '#' is stripped) is a *disabled* entry -- kept out of the main SDR
     selector but still shown (and re-enable/disable-toggleable) in the
-    Manage... dialog, so an SDR can be temporarily hidden without deleting
+    Setup dialog, so an SDR can be temporarily hidden without deleting
     it and losing its host/port. An ordinary comment (the header line, or
     anything that doesn't parse as an entry) is just a comment, as before."""
     if not os.path.exists(path):
@@ -2092,6 +2092,14 @@ class PanadapterApp:
         # _set_status.
         style.configure('StatusGreen.TLabel', padding=(4, 1), background='#4caf50', foreground='#000000')
         style.configure('StatusAmber.TLabel', padding=(4, 1), background='#ffb300', foreground='#000000')
+        # Trim the default theme's button padding so buttons sit at roughly
+        # the same height as the Comboboxes beside them in the control bar --
+        # the default TButton vertical padding is noticeably taller than a
+        # readonly Combobox's, which looked mismatched in the tight bar.
+        # Global (all ttk.Button widgets, dialogs included), since
+        # Green.TButton/Amber.TButton below only override colors and inherit
+        # padding from TButton.
+        style.configure('TButton', padding=(2, 1))
         self._theme_dark = None
         self._apply_control_bar_theme()
         # RX/SDR source toggle: green while FreeDV listens to the real
@@ -2142,16 +2150,30 @@ class PanadapterApp:
 
         self._status_var = tk.StringVar(value='Connecting')
         # Fixed width (like the S-meter's dBm label below) so
-        # Connecting/Disconnecting/Connected/Stopped text changes don't shift Manage/
-        # Stop/Auto/the combos left and right as the status changes.
-        self._status_label = ttk.Label(top, textvariable=self._status_var, width=21, anchor='w',
+        # Connecting/Disconnecting/Connected/Stopped text changes don't shift
+        # Setup/Play-Pause/Auto/the combos left and right as the status changes.
+        self._status_label = ttk.Label(top, textvariable=self._status_var, width=14, anchor='w',
                                         style='StatusAmber.TLabel')
         self._status_label.pack(side='left', padx=2)
 
-        ttk.Button(top, text='Manage...', command=self._open_sdr_manager).pack(side='left', padx=2)
+        # Walkman-style Play/Pause glyphs rather than a Start/Stop word --
+        # matches the fine-tune ◄/► buttons' iconic style, and reads at a
+        # glance without needing to parse text. Packed right after the
+        # status label (rather than after Setup) so it reads as directly
+        # tied to that connection state.
+        self._stop_btn_var = tk.StringVar(value='⏸')
+        self._stop_btn = ttk.Button(top, textvariable=self._stop_btn_var, command=self._toggle_stream, width=2)
+        self._stop_btn.pack(side='left', padx=1)
+        _Tooltip(self._stop_btn, lambda: 'Pause streaming' if self._stop_btn_var.get() == '⏸' else 'Resume streaming')
 
-        self._stop_btn_var = tk.StringVar(value='Stop')
-        ttk.Button(top, textvariable=self._stop_btn_var, command=self._toggle_stream, width=6).pack(side='left', padx=2)
+        # Plain tk.Button rather than ttk.Button here -- the active ttk theme
+        # ('default', which just wraps the classic Tk widgets) imposes a
+        # fixed ~70px minimum button width no matter how far its padding is
+        # trimmed, so a ttk button was always wider than "Setup"'s own text
+        # needed. tk.Button has no such floor and looks the same under this
+        # theme since it IS the same underlying widget.
+        tk.Button(top, text='Setup', padx=2, pady=1,
+                  command=self._open_sdr_manager).pack(side='left', padx=1)
 
         # Shows the current state (Auto/Manual), not the click target -- a
         # tooltip spells out the action since the label alone no longer does.
@@ -2159,8 +2181,8 @@ class PanadapterApp:
         # (following the rig) is the "normal" green state, Manual amber.
         self._auto_btn_var = tk.StringVar(value=('Manual' if self._manual else 'Auto'))
         self._auto_btn = ttk.Button(top, textvariable=self._auto_btn_var, command=self._toggle_auto_manual,
-                                     width=7, style=('Amber.TButton' if self._manual else 'Green.TButton'))
-        self._auto_btn.pack(side='left', padx=2)
+                                     width=6, style=('Amber.TButton' if self._manual else 'Green.TButton'))
+        self._auto_btn.pack(side='left', padx=1)
         _Tooltip(self._auto_btn, lambda: 'Click to switch to %s' % (
             'Auto' if self._auto_btn_var.get() == 'Manual' else 'Manual'))
 
@@ -2168,7 +2190,7 @@ class PanadapterApp:
         self._rx_source_btn = ttk.Button(top, textvariable=self._rx_source_var, command=self._toggle_rx_source,
                                           width=4,
                                           style=('Green.TButton' if self._rx_source == 'RX' else 'Amber.TButton'))
-        self._rx_source_btn.pack(side='left', padx=2)
+        self._rx_source_btn.pack(side='left', padx=1)
         _Tooltip(self._rx_source_btn, lambda: 'FreeDV RX audio: %s (click for %s)' % (
             self._rx_source_var.get(), 'SDR' if self._rx_source_var.get() == 'RX' else 'RX'))
 
@@ -2590,7 +2612,7 @@ class PanadapterApp:
             self._start_stream(entry)
             self._active_sdr = entry
             self._stopped = False
-            self._stop_btn_var.set('Stop')
+            self._stop_btn_var.set('⏸')
         else:
             self._set_status('Disconnecting')
             self._root.update()
@@ -2602,7 +2624,7 @@ class PanadapterApp:
             self._freq_var.set('-- kHz')
             self._dbm_var.set('-- dBm')
             self._set_status('Stopped')
-            self._stop_btn_var.set('Start')
+            self._stop_btn_var.set('▶')
 
     # -- Auto/Manual toggle + Zoom/Band/Mode/B-W combos -------------------------------
 
