@@ -2352,6 +2352,14 @@ class PanadapterApp:
         self._status_label.configure(style=('StatusGreen.TLabel' if text == 'Connected' else 'StatusAmber.TLabel'))
 
     def _start_stream(self, sdr_entry):
+        # Set/flush this first, before any of the blocking connection setup
+        # below (browser-mimic prefetch, its 0.25s stagger, the actual
+        # socket handshakes) -- previously this was only set at the very end
+        # of this method, leaving a dead period with no user feedback at all
+        # between clicking Play/switching SDRs and the status finally
+        # changing away from Stopped/Connected.
+        self._set_status('Connecting')
+        self._root.update()
         with self._freq_lock:
             dial_freq = self._current_freq_khz if self._current_freq_khz is not None else self._options.default_freq
         freq = self._sdr_tune_freq(dial_freq)
@@ -2410,7 +2418,6 @@ class PanadapterApp:
                 if self._audio_stream is not None:
                     self._audio_stream.retune(self._sdr_tune_freq(freq_now))
 
-        self._set_status('Connecting')
         self._stream_start_ts = time.time()
         if self._manual:
             # A freshly (re)created LiveAudioStream always starts with the
