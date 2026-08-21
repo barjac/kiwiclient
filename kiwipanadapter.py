@@ -2164,6 +2164,10 @@ class PanadapterApp:
         # what FreeDV hears" one.
         style.configure('Red.TButton', background='#e53935')
         style.map('Red.TButton', background=[('active', '#ef5350'), ('disabled', '#ef9a9a')])
+        # Rev checkbox: red indicator box (not the label) while reversed,
+        # same warning-red as SPK above, so the override reads as "not the
+        # normal convention" at a glance.
+        style.map('Rev.TCheckbutton', indicatorcolor=[('selected', '#e53935')])
 
         top = ttk.Frame(self._root, style='Control.TFrame')
         top.pack(side='top', fill='x', padx=4, pady=4)
@@ -2304,7 +2308,8 @@ class PanadapterApp:
         # Auto and Manual -- always enabled, unlike the combos above.
         self._reverse_sideband_var = tk.BooleanVar(value=self._reverse_sideband)
         self._reverse_sideband_chk = ttk.Checkbutton(top, text='Rev', variable=self._reverse_sideband_var,
-                                                       command=self._on_reverse_sideband_change)
+                                                       command=self._on_reverse_sideband_change,
+                                                       style='Rev.TCheckbutton')
         self._reverse_sideband_chk.pack(side='left', padx=(0, 4))
         _Tooltip(self._reverse_sideband_chk, lambda: 'Reverse sideband -- flip the band-convention '
                  'LSB/USB choice (currently %s)' % ('on' if self._reverse_sideband_var.get() else 'off'))
