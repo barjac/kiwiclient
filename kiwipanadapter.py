@@ -2182,6 +2182,21 @@ class PanadapterApp:
         # freq label -- these trim the actual SDR tuning
         # (sdr_freq_offset_hz), not the tracked dial frequency, so they're
         # active in both Auto and Manual.
+        # Plain tk.Button (not ttk) both to dodge the same fixed-width theme
+        # floor Setup works around above, and so its red stays put across
+        # light/dark control-bar theme switches rather than needing a ttk
+        # style. Packed before freq_frame (first among the side='right'
+        # widgets) so it claims the true far-right edge of the bar --
+        # freedv-start-pan normally kills this process itself on shutdown,
+        # but nothing does that when it's run standalone, and with the
+        # window decoration stripped there's no native close button either.
+        self._kill_btn = tk.Button(top, text='X', fg='white', bg='#e53935',
+                                    activebackground='#ef5350', activeforeground='white',
+                                    padx=3, pady=1, command=self._on_close)
+        self._kill_btn.pack(side='right', padx=(4, 0))
+        _Tooltip(self._kill_btn, lambda: 'Quit -- closes this panadapter (no window titlebar/close '
+                 'button, and nothing auto-kills it when run standalone)')
+
         freq_frame = ttk.Frame(top, style='Control.TFrame')
         freq_frame.pack(side='right')
         self._freq_down_btn = ttk.Button(freq_frame, text='◄', width=2,
