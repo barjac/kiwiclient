@@ -369,6 +369,7 @@ CONFIG_SCHEMA = {
     'sounddevice': str,
     'radio_capture_device': str,
     'rx_source_mode': str,
+    'spk_direct': parse_bool,
     'ncomp': parse_bool,
     'lp_cut': float,
     'hp_cut': float,
@@ -756,6 +757,34 @@ def _pw_link_set(src_ports, dst_ports, connect):
             logging.warning('%s raised %s', ' '.join(cmd), e)
             ok = False
     return ok
+
+
+def _headset_devices():
+    """Bare PipeWire node names of whatever this machine's ~/freedv-links
+    treats as 'the headset' -- i.e. every real device it links FDV_RX_out's
+    monitor to. The FDV_* virtual node names are fixed/portable across
+    machines, but what's actually plugged in behind FDV_RX_out never is
+    (and a machine can link more than one output at once, e.g. both onboard
+    speakers and a USB headset -- see the Desktop machine's copy), so this
+    reads the real name(s) fresh from that file rather than needing a
+    separate, manually-maintained config value. Returns [] if the file's
+    missing/unreadable or has no matching line."""
+    path = os.path.expanduser('~/freedv-links')
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except OSError as e:
+        logging.debug('freedv-links %r not read: %s', path, e)
+        return []
+    devices = set()
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        src, dst = parts
+        if src.startswith('FDV_RX_out:monitor'):
+            devices.add(dst.split(':', 1)[0])
+    return sorted(devices)
 
 
 _XWININFO_ID_RE = re.compile(r'^\s*(0x[0-9a-fA-F]+)\s+"([^"]*)"')
@@ -1905,6 +1934,11 @@ class PanadapterApp:
         # options.radio_capture_device) or 'SDR' (this panadapter's own
         # audio, via FDV_PAN). Audio-only -- unrelated to _manual above.
         self._rx_source = options.rx_source_mode
+        # Which audio feeds the physical headset: FreeDV's own decoded
+        # FDV_RX_out (False, the everyday state) or FDV_PAN direct (True --
+        # see _apply_spk_direct). Independent of self._rx_source above (that
+        # controls what FreeDV itself decodes; this controls what you hear).
+        self._spk_direct = options.spk_direct
         self._manual = options.manual_active
         self._manual_band = options.manual_band
         # Auto and Manual each remember their own last-used Mode combo
@@ -1999,6 +2033,20 @@ class PanadapterApp:
                 save_config_value(self._options.config, 'rx_source_mode', 'SDR')
             except Exception as e:
                 logging.debug('failed to save rx_source_mode: %s', e)
+
+        # Same idea for the persisted speaker-direct state -- self-heal to
+        # False (headset back on FreeDV's own decoded audio) if True was
+        # persisted but no headset device could be found via freedv-links.
+        if self._spk_direct and not self._apply_spk_direct(True):
+            logging.warning('headset device unavailable at startup -- leaving speaker on FreeDV RX audio')
+            self._spk_direct = False
+            self._spk_btn.configure(style='Green.TButton')
+            try:
+                save_config_value(self._options.config, 'spk_direct', False)
+            except Exception as e:
+                logging.debug('failed to save spk_direct: %s', e)
+        elif not self._spk_direct:
+            self._apply_spk_direct(False)
 
         root.update_idletasks()   # so winfo_width/height are accurate before the first row arrives
 
@@ -2109,6 +2157,13 @@ class PanadapterApp:
         style.map('Green.TButton', background=[('active', '#66bb6a'), ('disabled', '#a5d6a7')])
         style.configure('Amber.TButton', background='#ffb300')
         style.map('Amber.TButton', background=[('active', '#ffc107'), ('disabled', '#ffe082')])
+        # SPK (speaker-direct) toggle: red while active, to warn that the
+        # headset is bypassing FreeDV's own decoded audio entirely -- a
+        # deliberately different color from Green/Amber above since this
+        # isn't a "which normal source" choice, it's a "you're not hearing
+        # what FreeDV hears" one.
+        style.configure('Red.TButton', background='#e53935')
+        style.map('Red.TButton', background=[('active', '#ef5350'), ('disabled', '#ef9a9a')])
 
         top = ttk.Frame(self._root, style='Control.TFrame')
         top.pack(side='top', fill='x', padx=4, pady=4)
@@ -2193,6 +2248,18 @@ class PanadapterApp:
         self._rx_source_btn.pack(side='left', padx=1)
         _Tooltip(self._rx_source_btn, lambda: 'FreeDV RX audio: %s (click for %s)' % (
             self._rx_source_var.get(), 'SDR' if self._rx_source_var.get() == 'RX' else 'RX'))
+
+        # Speaker-direct toggle: fixed label (unlike Auto/Manual and RX/SDR
+        # above, which relabel themselves) since this is a warning-light
+        # style indicator, not a "which of two things" readout -- red means
+        # "headset is on the panadapter directly", off (green) means normal.
+        # Independent of the RX/SDR toggle above -- see _apply_spk_direct.
+        self._spk_btn = ttk.Button(top, text='SPK', command=self._toggle_spk_direct, width=3,
+                                   style=('Red.TButton' if self._spk_direct else 'Green.TButton'))
+        self._spk_btn.pack(side='left', padx=1)
+        _Tooltip(self._spk_btn, lambda: ('Headset: panadapter direct (click for FreeDV RX audio)'
+                                          if self._spk_direct else
+                                          'Headset: FreeDV RX audio (click to listen to panadapter directly)'))
 
         manual_combo_state = 'readonly' if self._manual else 'disabled'
 
@@ -2343,6 +2410,46 @@ class PanadapterApp:
             if radio:
                 _pw_link_set(radio, rx_in, connect=False)
             return True
+
+    def _apply_spk_direct(self, direct):
+        """direct: True routes the physical headset (see _headset_devices)
+        straight from FDV_PAN's monitor -- this panadapter's own raw
+        SDR/tuned audio -- instead of FreeDV's own decoded FDV_RX_out,
+        letting you listen to the off-air FreeDV transmission itself (Auto)
+        or whatever's tuned (Manual) without waiting on/needing a decode.
+        Deliberately independent of _apply_rx_source/the RX/SDR toggle
+        above -- FDV_PAN's link into FDV_RX_in (if any) is left completely
+        alone, since this only ever touches links into the headset. Returns
+        False (logging a warning, changing nothing) if freedv-links names no
+        headset device, or names one not currently in the PipeWire graph."""
+        devices = _headset_devices()
+        if not devices:
+            logging.warning('no headset device found via ~/freedv-links -- cannot switch speaker routing')
+            return False
+        pan = _pw_node_ports('FDV_PAN', 'o')
+        rx_out = _pw_node_ports('FDV_RX_out', 'o')
+        found = False
+        for dev in devices:
+            dev_in = _pw_node_ports(dev, 'i')
+            if not dev_in:
+                continue
+            found = True
+            # Paired per-device (rather than flattening every device's ports
+            # into one list) so a machine with more than one headset device
+            # wired in still gets each one linked/unlinked correctly --
+            # _pw_link_set pairs its two port lists positionally, which would
+            # otherwise misalign once more than one device's worth of ports
+            # got concatenated together.
+            if direct:
+                _pw_link_set(pan, dev_in, connect=True)
+                _pw_link_set(rx_out, dev_in, connect=False)
+            else:
+                _pw_link_set(rx_out, dev_in, connect=True)
+                _pw_link_set(pan, dev_in, connect=False)
+        if not found:
+            logging.warning('headset device(s) %s from freedv-links not found in the PipeWire graph', devices)
+            return False
+        return True
 
     def _set_status(self, text):
         """Sets the status text and its background -- green for 'Connected'
@@ -2666,6 +2773,20 @@ class PanadapterApp:
             save_config_value(self._options.config, 'rx_source_mode', new_mode)
         except Exception as e:
             logging.debug('failed to save rx_source_mode: %s', e)
+
+    def _toggle_spk_direct(self):
+        new_state = not self._spk_direct
+        if not self._apply_spk_direct(new_state):
+            # Graceful failure (no headset device found via freedv-links):
+            # _apply_spk_direct already logged why. State/config/PipeWire
+            # links are left exactly as they were -- nothing to undo here.
+            return
+        self._spk_direct = new_state
+        self._spk_btn.configure(style=('Red.TButton' if new_state else 'Green.TButton'))
+        try:
+            save_config_value(self._options.config, 'spk_direct', new_state)
+        except Exception as e:
+            logging.debug('failed to save spk_direct: %s', e)
 
     def _toggle_auto_manual(self):
         if self._manual:
@@ -3564,6 +3685,12 @@ def parse_args():
                     default=cfg.get('rx_source_mode', 'RX'),
                     help='initial FreeDV RX audio source -- RX (real radio) or SDR (this panadapter) '
                          '(config: rx_source_mode, default RX)')
+    p.add_argument('--spk-direct', dest='spk_direct', action='store_true',
+                    default=cfg.get('spk_direct', False),
+                    help='start with the headset routed straight from this panadapter\'s own audio '
+                         'instead of FreeDV\'s decoded RX audio -- see the SPK button; the headset '
+                         'device itself is read from ~/freedv-links, not configured here '
+                         '(config: spk_direct, default false)')
     p.add_argument('--ncomp', '--no-compression', dest='ncomp', action='store_true',
                     default=cfg.get('ncomp', False),
                     help="don't use audio compression -- better quality for a data-mode decoder like FreeDV, "
