@@ -15,6 +15,7 @@
 # audio no longer needs a separately-spawned kiwiclientd.py process.
 
 import argparse
+import fcntl
 import http.client
 import logging
 import math
@@ -24,6 +25,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 from queue import Queue, Empty
@@ -2622,7 +2624,9 @@ class PanadapterApp:
     def _schedule_reconnect(self):
         if self._reconnect_retry_count >= MAX_RECONNECT_RETRIES:
             logging.warning('connection to %s failed %d times in a row, giving up automatic retry -- '
-                             'reselect the SDR to try again', self._active_sdr['name'], self._reconnect_retry_count)
+                             'press Play or reselect the SDR to try again', self._active_sdr['name'],
+                             self._reconnect_retry_count)
+            self._give_up_reconnect()
             return
         self._reconnect_retry_count += 1
         logging.info('connection to %s dropped, retrying both sides together (%d/%d)...',
@@ -2657,6 +2661,34 @@ class PanadapterApp:
             self._start_stream(sdr_entry)
 
         self._reconnect_after_id = self._root.after(int(RECONNECT_RETRY_DELAY_SEC * 1000), do_reconnect)
+
+    def _give_up_reconnect(self):
+        """Reached MAX_RECONNECT_RETRIES with no success -- land in the same
+        state a manual Stop would, rather than leaving the worker threads
+        dead but self._active_sdr/self._stopped still claiming a live
+        connection. Previously this left the status stuck on whatever
+        _start_stream's last (failed) attempt had set it to -- "Connecting"
+        forever, with nothing on screen to show anything had actually
+        stopped -- and, since self._active_sdr was never cleared,
+        _poll_reconnect kept re-entering _schedule_reconnect's give-up
+        branch (and its log line) every single poll tick after that,
+        forever. Clearing self._active_sdr here stops that, and leaves
+        Play (or reselecting the SDR, the other advertised recovery route)
+        working immediately, the same as after a normal Stop."""
+        self._stop_stream()
+        self._active_sdr = None
+        self._stopped = True
+        self._reset_display_state()
+        self._redraw()
+        self._freq_var.set('-- kHz')
+        self._dbm_var.set('-- dBm')
+        # "Launch fail" rather than a flat "Failed" or a guess like
+        # "Duplicate" -- the actual cause can be anything (a second instance
+        # already holding this Kiwi's one connection slot, a genuinely dead
+        # server, ...), so this only claims that connecting didn't work
+        # after MAX_RECONNECT_RETRIES tries, not why.
+        self._set_status('Launch fail')
+        self._stop_btn_var.set('▶')
 
     def _reset_display_state(self):
         while True:
@@ -3787,11 +3819,35 @@ def parse_args():
     return p.parse_args()
 
 
+def _acquire_instance_lock(config_path):
+    """Refuse to start a second instance against the same config, rather
+    than letting both race to connect and rely on the Kiwi server's own
+    same-IP admission logic to reject the loser after the fact -- a live
+    'No multiple connections from the same IP address' error (and the
+    reconnect-forever loop it drove, see _give_up_reconnect) turned out to
+    be exactly two copies started against one Kiwi, not a flaky server.
+    flock rather than a PID file: the OS drops the lock the instant the
+    holding process's fd table goes away, whatever the exit reason (clean
+    shutdown, crash, kill -9), so there's no stale-lock case to clean up.
+    The returned file object must be kept referenced for the app's entire
+    life -- closing it (even via garbage collection) releases the lock."""
+    lock_path = config_path + '.lock'
+    lock_file = open(lock_path, 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.stderr.write('kiwipanadapter: another instance is already running against %s -- exiting\n'
+                          % config_path)
+        sys.exit(1)
+    return lock_file
+
+
 def main():
     options = parse_args()
     if options.list_sound_devices:
         print(sc.all_speakers())
         return
+    instance_lock = _acquire_instance_lock(options.config)
     logging.basicConfig(level=logging.getLevelName(options.log_level.upper()),
                          format='%(asctime)-15s %(message)s')
     root = tk.Tk()
