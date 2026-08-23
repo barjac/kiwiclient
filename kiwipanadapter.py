@@ -1924,6 +1924,10 @@ class PanadapterApp:
         self._reconnect_after_id = None
         self._stream_start_ts = None
         self._stopped = False
+        # Set first thing in _on_close, before destroy() -- guards every
+        # self-rescheduling after() loop below against firing again (and
+        # touching now-destroyed widgets) once shutdown has started.
+        self._closing = False
 
         # Manual tuning state -- self._manual is the single global Auto/Manual
         # gate; while True, _on_rigctl_freq/_on_rigctl_mode below are ignored
@@ -2581,6 +2585,8 @@ class PanadapterApp:
             self._audio_stream = None
 
     def _poll_reconnect(self):
+        if self._closing:
+            return
         # Some Kiwis' admission of a second (mimic_browser) connection isn't
         # 100% reliable even with full browser mimicry -- live-tested at
         # ~83% in isolation, but retrying just the one side that died against
@@ -2749,6 +2755,8 @@ class PanadapterApp:
         bar if it changed, then reschedule itself -- so a Breeze theme
         switch while the app is running is picked up live, not just at
         startup."""
+        if self._closing:
+            return
         dark = _detect_dark_theme()
         if dark != self._theme_dark:
             self._theme_dark = dark
@@ -3168,6 +3176,8 @@ class PanadapterApp:
     # -- GUI update loop --------------------------------------------------------------
 
     def _poll_queue(self):
+        if self._closing:
+            return
         latest = None
         try:
             while True:
@@ -3299,6 +3309,8 @@ class PanadapterApp:
         up/reclaims exactly the space it needs. Deliberately low-rate
         (SNAP_POLL_MS), re-deriving and re-applying geometry from scratch
         every tick rather than tracking/diffing against what was last set."""
+        if self._closing:
+            return
         if self._snap_target_id is None:
             self._snap_target_id = _find_window_id(self._options.snap_below_title)
             if self._snap_target_id is None:
@@ -3578,6 +3590,12 @@ class PanadapterApp:
             c.create_text(x + 2, 0, text=label, fill='white', anchor='n', font=('TkFixedFont', 7))
 
     def _on_close(self):
+        # Stops _poll_queue/_apply_control_bar_theme/_poll_reconnect/
+        # _poll_snap_target from touching any widget once one of their
+        # already-scheduled after() callbacks fires after destroy() below --
+        # that race produced "invalid command name" TclErrors from
+        # _poll_queue's _set_status call on close.
+        self._closing = True
         if self._geometry_save_after_id is not None:
             self._root.after_cancel(self._geometry_save_after_id)
             self._geometry_save_after_id = None
