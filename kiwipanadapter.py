@@ -2215,6 +2215,10 @@ class PanadapterApp:
         self._freq_up_btn.pack(side='left', padx=(0, 4))
         _Tooltip(self._freq_up_btn, lambda: 'SDR trim %+g Hz (currently %+g Hz)' % (
             FINE_TUNE_STEP_HZ, self._sdr_freq_offset_hz))
+        # Green/amber same convention as Auto/Manual and RX/SDR above -- amber
+        # flags a nonzero trim so a forgotten offset from a previous session
+        # doesn't silently shift where this SDR listens relative to the dial.
+        self._update_fine_tune_style()
         self._freq_var = tk.StringVar(value='-- kHz')
         ttk.Label(freq_frame, textvariable=self._freq_var, font=('TkFixedFont', 11, 'bold'),
                   style='Control.TLabel').pack(side='left')
@@ -3032,8 +3036,18 @@ class PanadapterApp:
         kiwipanadapter believes it's tuned to."""
         return dial_freq_khz + self._sdr_freq_offset_hz / 1000.0
 
+    def _update_fine_tune_style(self):
+        """Each arrow goes amber only when the trim sits on its own side of
+        zero (► for >0, ◄ for <0) -- so the amber button also points which
+        way to nudge back to clear it. Both green at exactly zero."""
+        self._freq_down_btn.configure(
+            style='Amber.TButton' if self._sdr_freq_offset_hz < 0 else 'Green.TButton')
+        self._freq_up_btn.configure(
+            style='Amber.TButton' if self._sdr_freq_offset_hz > 0 else 'Green.TButton')
+
     def _nudge_sdr_offset(self, delta_hz):
         self._sdr_freq_offset_hz += delta_hz
+        self._update_fine_tune_style()
         try:
             save_config_value(self._options.config, 'sdr_freq_offset_hz', self._sdr_freq_offset_hz)
         except Exception as e:
