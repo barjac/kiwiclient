@@ -3749,7 +3749,9 @@ def parse_args():
     p.add_argument('--last-sdr', dest='last_sdr', default=cfg.get('last_sdr', None),
                     help='name of the SDR entry selected last session; used as the initial selection, saved back '
                          'to the config whenever the SDR dropdown changes (config: last_sdr)')
-    p.add_argument('--user', default='kiwipanadapter', help='client name reported to the Kiwi')
+    p.add_argument('--user', default=cfg.get('user', 'kiwipanadapter'),
+                    help='client name reported to the Kiwi -- e.g. your callsign, so the SDR owner/other '
+                         'listeners see who is connected instead of the generic default (config: user)')
     p.add_argument('--default-freq', dest='default_freq', type=float, default=cfg.get('default_freq', 14200.0),
                     help='initial center frequency (kHz) used until the first rigctl poll arrives (config: default_freq)')
     p.add_argument('--modulation', default=cfg.get('modulation', 'usb'),
