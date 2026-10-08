@@ -2532,6 +2532,13 @@ class PanadapterApp:
         Disconnecting/Stopped)."""
         self._status_var.set(text)
         self._status_label.configure(style=('StatusGreen.TLabel' if text == 'Connected' else 'StatusAmber.TLabel'))
+        # Whether a connection is actually live (data arriving), so switching
+        # SDR or stopping only says "Disconnecting" when there is something
+        # to disconnect from -- not while an attempt is still failing.
+        if text == 'Connected':
+            self._is_connected = True
+        elif text not in ('Disconnecting',):
+            self._is_connected = False
 
     def _start_stream(self, sdr_entry):
         # Set/flush this first, before any of the blocking connection setup
@@ -2805,7 +2812,7 @@ class PanadapterApp:
         # look like it did nothing for a couple of seconds. update_idletasks()
         # alone wasn't enough to force the actual repaint out to the display
         # before the blocking joins below ran; update() forces that.
-        self._set_status('Disconnecting')
+        self._set_status('Disconnecting' if getattr(self, '_is_connected', False) else 'Connecting')
         self._root.update()
         self._stop_stream()
         self._reset_display_state()
@@ -2853,7 +2860,7 @@ class PanadapterApp:
             self._stopped = False
             self._stop_btn_var.set('⏸')
         else:
-            self._set_status('Disconnecting')
+            self._set_status('Disconnecting' if getattr(self, '_is_connected', False) else 'Stopping')
             self._root.update()
             self._stop_stream()
             self._active_sdr = None
