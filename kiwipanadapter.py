@@ -36,7 +36,8 @@ import soundcard as sc
 import tkinter as tk
 from tkinter import ttk
 
-from kiwi.client import KiwiSDRStream
+from kiwi.client import (KiwiSDRStream, KiwiDownError, KiwiTooBusyError, KiwiBadPasswordError,
+                         KiwiConnectionError, KiwiCampError, KiwiTimeLimitError)
 from kiwi.worker import KiwiWorker
 
 HAS_RESAMPLER = True
@@ -1081,7 +1082,51 @@ class RigctlPoller(threading.Thread):
                 pass
 
 
-class LiveWFStream(KiwiSDRStream):
+def describe_connect_failure(e):
+    """Short, status-box-sized reason for a failed or dropped Kiwi connection."""
+    if isinstance(e, KiwiDownError):
+        return 'SDR down'
+    if isinstance(e, KiwiTooBusyError):
+        return 'SDR full'
+    if isinstance(e, KiwiBadPasswordError):
+        return 'No slot'
+    if isinstance(e, KiwiConnectionError):
+        return 'IP limit' if 'same IP' in str(e) else 'Refused'
+    if isinstance(e, KiwiCampError):
+        return 'Camp fail'
+    if isinstance(e, KiwiTimeLimitError):
+        return 'Time limit'
+    if isinstance(e, (socket.timeout, TimeoutError)) or 'timed out' in str(e):
+        return 'Timeout'
+    if isinstance(e, ConnectionRefusedError):
+        return 'Refused'
+    if isinstance(e, socket.gaierror):
+        return 'Bad addr'
+    return 'Error'
+
+
+class FailReasonMixin:
+    """Records why a stream's connection failed, for the status box. The
+    worker thread only logs these errors, so without this the GUI can't
+    tell an SDR that's switched off from one that's merely unreachable."""
+    fail_reason = None
+
+    def connect(self, host, port):
+        try:
+            return super().connect(host, port)
+        except Exception as e:
+            self.fail_reason = describe_connect_failure(e)
+            raise
+
+    def _process_msg_param(self, name, value):
+        try:
+            return super()._process_msg_param(name, value)
+        except Exception as e:
+            self.fail_reason = describe_connect_failure(e)
+            raise
+
+
+class LiveWFStream(FailReasonMixin, KiwiSDRStream):
     """A single waterfall-only Kiwi connection that can be recentered on the fly.
 
     Kept as its own connection rather than merged onto LiveAudioStream's
@@ -1211,7 +1256,7 @@ class LiveWFStream(KiwiSDRStream):
                 pass
 
 
-class LiveAudioStream(KiwiSDRStream):
+class LiveAudioStream(FailReasonMixin, KiwiSDRStream):
     """A single SND-type Kiwi connection: demodulated/IQ audio played to a
     local sound device, with live retune/mode-change support driven by
     rigctl polling. Runs in-process (its own thread pair via KiwiWorker)
@@ -2623,7 +2668,11 @@ class PanadapterApp:
                     logging.warning('%s stream on %s stalled (no data for %.0fs), reconnecting',
                                      'W/F' if wf_stale else 'audio', self._active_sdr['name'],
                                      STREAM_STALE_TIMEOUT_SEC)
-                self._schedule_reconnect()
+                reason = next((st.fail_reason for st in (self._wf_stream, self._audio_stream)
+                               if st is not None and st.fail_reason), None)
+                if reason is None:
+                    reason = 'No data' if (wf_stale or audio_stale) else 'Dropped'
+                self._schedule_reconnect(reason)
             elif (self._reconnect_retry_count > 0 and self._stream_start_ts is not None
                   and time.time() - self._stream_start_ts >= RECONNECT_HEALTHY_RESET_SEC):
                 logging.info('connection to %s has been up %.0fs, resetting retry counter',
@@ -2631,16 +2680,25 @@ class PanadapterApp:
                 self._reconnect_retry_count = 0
         self._root.after(1000, self._poll_reconnect)
 
-    def _schedule_reconnect(self):
+    def _schedule_reconnect(self, reason='Dropped'):
+        # An SDR the owner has switched off answers every attempt with the
+        # same 'down' message, so retrying it only adds load -- stop at once.
+        if reason == 'SDR down':
+            logging.warning('%s reports it is down (owner/maintenance), not retrying', self._active_sdr['name'])
+            self._give_up_reconnect(reason)
+            return
         if self._reconnect_retry_count >= MAX_RECONNECT_RETRIES:
-            logging.warning('connection to %s failed %d times in a row, giving up automatic retry -- '
+            logging.warning('connection to %s failed %d times in a row (%s), giving up automatic retry -- '
                              'press Play or reselect the SDR to try again', self._active_sdr['name'],
-                             self._reconnect_retry_count)
-            self._give_up_reconnect()
+                             self._reconnect_retry_count, reason)
+            self._give_up_reconnect(reason)
             return
         self._reconnect_retry_count += 1
-        logging.info('connection to %s dropped, retrying both sides together (%d/%d)...',
-                     self._active_sdr['name'], self._reconnect_retry_count, MAX_RECONNECT_RETRIES)
+        retry_text = '%s %d/%d' % (reason, self._reconnect_retry_count, MAX_RECONNECT_RETRIES)
+        logging.info('connection to %s: %s, retrying both sides together (%d/%d)...',
+                     self._active_sdr['name'], reason, self._reconnect_retry_count, MAX_RECONNECT_RETRIES)
+        # Shown until a retry succeeds (-> Connected); Play/Pause cancels.
+        self._set_status(retry_text)
 
         def do_reconnect():
             self._reconnect_after_id = None
@@ -2669,10 +2727,11 @@ class PanadapterApp:
                 self._audio_worker = None
                 self._audio_stream = None
             self._start_stream(sdr_entry)
+            self._set_status(retry_text)   # _start_stream resets it to Connecting
 
         self._reconnect_after_id = self._root.after(int(RECONNECT_RETRY_DELAY_SEC * 1000), do_reconnect)
 
-    def _give_up_reconnect(self):
+    def _give_up_reconnect(self, reason=None):
         """Reached MAX_RECONNECT_RETRIES with no success -- land in the same
         state a manual Stop would, rather than leaving the worker threads
         dead but self._active_sdr/self._stopped still claiming a live
@@ -2697,7 +2756,9 @@ class PanadapterApp:
         # already holding this Kiwi's one connection slot, a genuinely dead
         # server, ...), so this only claims that connecting didn't work
         # after MAX_RECONNECT_RETRIES tries, not why.
-        self._set_status('Launch fail')
+        # Just the reason once stopped (no n/5 count, and Play shows ▶);
+        # must fit the 14-character status box.
+        self._set_status(reason if reason else 'Launch fail')
         self._stop_btn_var.set('▶')
 
     def _reset_display_state(self):
