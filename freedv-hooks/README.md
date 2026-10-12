@@ -7,12 +7,13 @@ it when FreeDV closes.
 
 ## Install
 
-Link both into the radio's hooks folder (RADIO is the radio's folder name
+Link all three into the radio's hooks folder (RADIO is the radio's folder name
 under `~/.config/freedv-rade-setup/`, e.g. `ts-450s`):
 
     mkdir -p ~/.config/freedv-rade-setup/RADIO/hooks
     ln -s ~/GIT/kiwiclient/freedv-hooks/before-freedv ~/.config/freedv-rade-setup/RADIO/hooks/
     ln -s ~/GIT/kiwiclient/freedv-hooks/after-freedv  ~/.config/freedv-rade-setup/RADIO/hooks/
+    ln -s ~/GIT/kiwiclient/freedv-hooks/env           ~/.config/freedv-rade-setup/RADIO/hooks/
 
 Use links, not copies: the hooks find the kiwiclient folder through them,
 and a `git pull` here then updates them.
@@ -26,6 +27,10 @@ and a `git pull` here then updates them.
   the same file, so `panadapter.conf` needs no sound device names. Its
   output goes to `kiwipanadapter.log` in the radio's folder.
 - `after-freedv` stops it.
+- `env` runs FreeDV under X11 (`GDK_BACKEND=x11`): the panadapter finds the
+  Reporter window (`snap_below_title`) with X11 tools, which can't see a
+  native Wayland window. Needs freedv-rade-setup from 12 Oct 2026 or later
+  (the start script reads `hooks/env`).
 
 ## Note
 

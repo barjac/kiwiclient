@@ -1,0 +1,5 @@
+# freedv-rade-setup hooks/env: read by the radio's start script just before
+# FreeDV starts. The panadapter finds FreeDV's windows (snap_below_title,
+# e.g. the Reporter) with X11 tools, which can't see a native Wayland
+# window, so run FreeDV under X11 (XWayland on a Wayland desktop).
+export GDK_BACKEND=x11
