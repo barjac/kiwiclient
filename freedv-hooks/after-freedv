@@ -1,0 +1,7 @@
+#!/bin/bash
+# freedv-rade-setup hook: stop the panadapter started by before-freedv.
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/kiwipanadapter.pid"
+if [[ -f $PIDFILE ]]; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null && echo "Panadapter stopped"
+    rm -f "$PIDFILE"
+fi

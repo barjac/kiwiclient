@@ -762,6 +762,13 @@ def _pw_link_set(src_ports, dst_ports, connect):
     return ok
 
 
+def _freedv_links_path():
+    """The links file to read the headset from: $FREEDV_LINKS if set (the
+    freedv-hooks scripts set it to the radio's own links file written by
+    freedv-rade-setup), otherwise ~/freedv-links."""
+    return os.path.expanduser(os.environ.get('FREEDV_LINKS') or '~/freedv-links')
+
+
 def _headset_devices():
     """Bare PipeWire node names of whatever this machine's ~/freedv-links
     treats as 'the headset' -- i.e. every real device it links FDV_RX_out's
@@ -771,8 +778,9 @@ def _headset_devices():
     speakers and a USB headset -- see the Desktop machine's copy), so this
     reads the real name(s) fresh from that file rather than needing a
     separate, manually-maintained config value. Returns [] if the file's
-    missing/unreadable or has no matching line."""
-    path = os.path.expanduser('~/freedv-links')
+    missing/unreadable or has no matching line. The file can be another one
+    in the same format, see _freedv_links_path()."""
+    path = _freedv_links_path()
     try:
         with open(path) as f:
             lines = f.readlines()
@@ -2499,7 +2507,7 @@ class PanadapterApp:
         headset device, or names one not currently in the PipeWire graph."""
         devices = _headset_devices()
         if not devices:
-            logging.warning('no headset device found via ~/freedv-links -- cannot switch speaker routing')
+            logging.warning('no headset device found via %s -- cannot switch speaker routing', _freedv_links_path())
             return False
         pan = _pw_node_ports('FDV_PAN', 'o')
         rx_out = _pw_node_ports('FDV_RX_out', 'o')

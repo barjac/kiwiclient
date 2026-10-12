@@ -1,0 +1,49 @@
+#!/bin/bash
+# freedv-rade-setup hook: start kiwipanadapter with FreeDV.
+#
+# Link it (and after-freedv) into the radio's hooks folder, e.g.
+#   mkdir -p ~/.config/freedv-rade-setup/RADIO/hooks
+#   ln -s ~/GIT/kiwiclient/freedv-hooks/before-freedv ~/.config/freedv-rade-setup/RADIO/hooks/
+#   ln -s ~/GIT/kiwiclient/freedv-hooks/after-freedv  ~/.config/freedv-rade-setup/RADIO/hooks/
+# The radio's start script runs it just before FreeDV, after its links are
+# made, and after-freedv when FreeDV closes.
+#
+# The panadapter's RX/SDR switch moves FDV_RX_in between the radio and
+# FDV_PAN. Save the links in freedv-rade-setup only in RX mode, or the saved
+# list loses the radio -> FDV_RX_in link.
+
+# $0 is the link in RADIO/hooks; the real file is in kiwiclient/freedv-hooks
+RADIO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+KIWI_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+LINKS="$RADIO_DIR/links"
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/kiwipanadapter.pid"
+
+# FDV_PAN carries the panadapter's own audio (into FDV_RX_in in SDR mode).
+# The start script restarts the sound first, so it has to be made each time.
+if ! pactl list sinks short | grep -qw FDV_PAN; then
+    echo "Creating FDV_PAN"
+    pactl load-module module-null-sink sink_name=FDV_PAN \
+        sink_properties="media.role=phone session.suspend-timeout-seconds=9999" >/dev/null
+fi
+
+# An instance left over from an unclean exit. pgrep -f: the name is longer
+# than the 15 characters pgrep -x sees.
+old=$(pgrep -f "kiwipanadapter\.py")
+if [[ -n $old ]]; then
+    echo "Stopping a panadapter left running: $old"
+    kill $old 2>/dev/null
+    sleep 0.2
+fi
+
+# The radio's RX node is whatever the links file feeds into FDV_RX_in
+# (radio-rx:capture_MONO with freedv-rade-setup's names); the headset is read
+# from the same file (FREEDV_LINKS), so panadapter.conf needs neither.
+rx=$(awk '$2 ~ /^FDV_RX_in:/ { print $1; exit }' "$LINKS" 2>/dev/null)
+args=()
+[[ -n $rx ]] && args=(--radio-capture-device "$rx")
+
+echo "Starting panadapter"
+# 9>&- : don't hold the start script's lock (see freedv-rade-setup)
+FREEDV_LINKS="$LINKS" GDK_BACKEND=x11 nohup "$KIWI_DIR/kiwipanadapter.py" "${args[@]}" \
+    > "$RADIO_DIR/kiwipanadapter.log" 2>&1 < /dev/null 9>&- &
+echo $! > "$PIDFILE"
