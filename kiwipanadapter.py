@@ -3685,6 +3685,8 @@ class PanadapterApp:
         # already-scheduled after() callbacks fires after destroy() below --
         # that race produced "invalid command name" TclErrors from
         # _poll_queue's _set_status call on close.
+        if self._closing:
+            return   # already closing (e.g. a signal and the close button)
         self._closing = True
         if self._geometry_save_after_id is not None:
             self._root.after_cancel(self._geometry_save_after_id)
@@ -3974,8 +3976,12 @@ def main():
         # shutdown path instead. Safe to call mid-mainloop: Tkinter's own
         # after() timers (150ms-5s) already return control to Python often
         # enough for the interpreter to notice and run this promptly.
+        # Schedule the close rather than running it here: Python runs this
+        # handler wherever the main thread happens to be, which can be the
+        # middle of _poll_queue -> _redraw, and destroying the window under
+        # it gave "invalid command name .!canvas2" TclErrors on stop.
         logging.info('received signal %d, shutting down', signum)
-        app._on_close()
+        root.after_idle(app._on_close)
 
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGQUIT, _handle_shutdown_signal)
