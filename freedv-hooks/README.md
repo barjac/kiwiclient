@@ -25,7 +25,10 @@ and a `git pull` here then updates them.
   radio's RX node (whatever the radio's `links` file feeds into
   `FDV_RX_in`, normally `radio-rx:capture_MONO`) and reads the headset from
   the same file, so `panadapter.conf` needs no sound device names. Its
-  output goes to `kiwipanadapter.log` in the radio's folder.
+  output goes to `kiwipanadapter.log` in the radio's folder. The Auto
+  passband preset follows the FreeDV build: FDV2 for a RADE V2 build, FDV1
+  otherwise (needs freedv-rade-setup from 17 Oct 2026 or later, whose start
+  script sets `FREEDV_RADE`; with an older one the saved choice is used).
 - `after-freedv` stops it.
 - `env` runs FreeDV under X11 (`GDK_BACKEND=x11`): the panadapter finds the
   Reporter window (`snap_below_title`) with X11 tools, which can't see a

@@ -41,6 +41,12 @@ fi
 rx=$(awk '$2 ~ /^FDV_RX_in:/ { print $1; exit }' "$LINKS" 2>/dev/null)
 args=()
 [[ -n $rx ]] && args=(--radio-capture-device "$rx")
+# Auto's passband preset follows the FreeDV build's RADE mode (FREEDV_RADE,
+# set by freedv-rade-setup's start script): FDV2 is the narrower one
+case ${FREEDV_RADE:-} in
+    V2) args+=(--auto-mode FDV2) ;;
+    V1) args+=(--auto-mode FDV1) ;;
+esac
 
 echo "Starting panadapter"
 # 9>&- : don't hold the start script's lock (see freedv-rade-setup)
