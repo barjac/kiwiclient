@@ -1308,6 +1308,11 @@ class LiveAudioStream(FailReasonMixin, KiwiSDRStream):
         # Playback rate adjustment tracking
         self._pending_audio_history = []
         self._playback_rate_adjustment = 1.0
+
+        # False while nothing hears this audio -- RX source with SPK off (set
+        # by PanadapterApp._update_audio_wanted). Still received, for the
+        # S-meter and liveness, just not played.
+        self.audio_wanted = True
         self._last_rate_check_time = None
 
         # close() can be called from two different threads for the same
@@ -1433,6 +1438,13 @@ class LiveAudioStream(FailReasonMixin, KiwiSDRStream):
     def _queue_audio(self, samples):
         """Queue audio samples for non-blocking playback. Accumulates if queue is full."""
         self._last_data_ts = time.time()
+        if not self.audio_wanted:
+            # Not linked anywhere: don't resample, queue and play audio nobody
+            # hears (~12% of a Raspberry Pi 4 core). Start afresh when wanted.
+            self._pending_audio = None
+            self._pending_audio_history = []
+            self._playback_rate_adjustment = 1.0
+            return
         self._update_playback_rate_adjustment()
 
         if self._playback_rate_adjustment != 1.0:
@@ -2139,6 +2151,7 @@ class PanadapterApp:
                 logging.debug('failed to save spk_direct: %s', e)
         elif not self._spk_direct:
             self._apply_spk_direct(False)
+        self._update_audio_wanted()   # both may have self-healed above
 
         root.update_idletasks()   # so winfo_width/height are accurate before the first row arrives
 
@@ -2484,6 +2497,7 @@ class PanadapterApp:
                                          ws_offset=1, mimic_browser=mimic_browser, ws_timestamp=ws_timestamp)
         self._audio_stream = LiveAudioStream(audio_opt, freq, self._options.modulation,
                                               self._options.lp_cut, self._options.hp_cut)
+        self._update_audio_wanted()
         self._audio_run_event = threading.Event()
         self._audio_run_event.set()
         audio_camp_wait_event = threading.Event()
@@ -2932,6 +2946,13 @@ class PanadapterApp:
         # comments in _build_ui for why).
         self._band_combo.config(state=('readonly' if manual else 'disabled'))
 
+    def _update_audio_wanted(self):
+        """The Kiwi's audio (FDV_PAN) only goes anywhere when FreeDV takes its
+        RX audio from it (SDR) or SPK routes it to the headset; otherwise
+        the audio stream skips playing it."""
+        if self._audio_stream is not None:
+            self._audio_stream.audio_wanted = self._rx_source == 'SDR' or self._spk_direct
+
     def _toggle_rx_source(self):
         new_mode = 'SDR' if self._rx_source == 'RX' else 'RX'
         if not self._apply_rx_source(new_mode):
@@ -2940,6 +2961,7 @@ class PanadapterApp:
             # links are left exactly as they were -- nothing to undo here.
             return
         self._rx_source = new_mode
+        self._update_audio_wanted()
         self._rx_source_var.set(new_mode)
         self._rx_source_btn.configure(style=('Green.TButton' if new_mode == 'RX' else 'Amber.TButton'))
         try:
@@ -2955,6 +2977,7 @@ class PanadapterApp:
             # links are left exactly as they were -- nothing to undo here.
             return
         self._spk_direct = new_state
+        self._update_audio_wanted()
         self._spk_btn.configure(style=('Red.TButton' if new_state else 'Green.TButton'))
         try:
             save_config_value(self._options.config, 'spk_direct', new_state)
