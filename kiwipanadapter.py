@@ -2003,6 +2003,11 @@ class PanadapterApp:
         self._row_queue = queue.Queue(maxsize=2)
         self._img_buf = np.zeros((MAX_HISTORY_ROWS, WF_NATIVE_BINS, 3), dtype=np.uint8)
         self._photo = None
+        # The on-screen waterfall is a ring in self._photo (see _redraw_new_row)
+        self._ring_pos = 0          # photo row holding the newest row
+        self._ring_size = None      # (w, h) the photo was built for
+        self._ring_dx = 0           # drag-pan preview offset, canvas px
+        self._freq_axis_key = None  # inputs of the last _draw_freq_axis
         self._worker = None
         self._run_event = None
         self._wf_stream = None
@@ -2458,7 +2463,10 @@ class PanadapterApp:
 
         self._canvas = tk.Canvas(self._root, highlightthickness=0, bg='black')
         self._canvas.pack(side='top', fill='both', expand=True)
+        # Two items showing the same photo: the ring's newer part (photo rows
+        # ring_pos..h-1) at the top, its older part (rows 0..ring_pos-1) below
         self._image_id = self._canvas.create_image(0, 0, anchor='nw')
+        self._image_id2 = self._canvas.create_image(0, 0, anchor='nw')
         self._canvas.bind('<Configure>', self._on_resize)
         self._sensitivity_var = tk.StringVar(value='Auto (adaptive)')
         self._canvas.bind('<Button-3>', self._show_sensitivity_menu)
@@ -3335,7 +3343,8 @@ class PanadapterApp:
             self._set_status('Connected')
             self._freq_var.set('%.3f kHz' % latest['center'])
             self._ingest_row(latest)
-            self._redraw()
+            self._redraw_new_row()
+            self._redraw_overlays()
 
         # The Kiwi keeps streaming perfectly normal-looking waterfall rows
         # regardless of whether rigctl is actually reachable -- the numeric
@@ -3538,6 +3547,8 @@ class PanadapterApp:
         self._redraw()
 
     def _redraw(self):
+        """Full redraw: the whole waterfall image from self._img_buf, plus the
+        S-meter and frequency axis."""
         canvas_w = max(1, self._canvas.winfo_width())
         canvas_h = max(1, self._canvas.winfo_height())
         display_rows = min(canvas_h, MAX_HISTORY_ROWS)
@@ -3547,8 +3558,45 @@ class PanadapterApp:
         ppm = header + img.tobytes()
         photo = tk.PhotoImage(width=canvas_w, height=canvas_h, data=ppm, format='PPM')
         self._canvas.itemconfig(self._image_id, image=photo)
+        self._canvas.itemconfig(self._image_id2, image=photo)
         self._photo = photo   # keep a reference, Tk drops images with no owner
+        self._ring_pos = 0
+        self._ring_size = (canvas_w, canvas_h)
+        self._place_ring()
+        self._freq_axis_key = None
+        self._redraw_overlays()
 
+    def _place_ring(self):
+        """Position the two image items so the ring reads newest-first from
+        the top: photo row ring_pos at canvas y 0, the rows before it below."""
+        h = self._ring_size[1] if self._ring_size else 0
+        self._canvas.coords(self._image_id, self._ring_dx, -self._ring_pos)
+        self._canvas.coords(self._image_id2, self._ring_dx, h - self._ring_pos)
+
+    def _redraw_new_row(self):
+        """Add the newest row (self._img_buf[0]) to the on-screen waterfall.
+        Rebuilding the whole image every row -- rescale, PPM-encode, and a
+        new Tk image decoded from it -- cost ~23% of a Raspberry Pi 4 core,
+        in proportion to the window's area (even the part hidden under other
+        windows). Instead the photo is a ring: the new row overwrites the
+        oldest one in place and the two image items move up one row, so
+        each row costs one row's worth. Only exact while every buffer row is
+        one screen row (window no taller than MAX_HISTORY_ROWS); otherwise,
+        or after a resize, it falls back to the full _redraw()."""
+        canvas_w = max(1, self._canvas.winfo_width())
+        canvas_h = max(1, self._canvas.winfo_height())
+        if (self._photo is None or self._ring_size != (canvas_w, canvas_h)
+                or canvas_h > MAX_HISTORY_ROWS):
+            self._redraw()
+            return
+        self._ring_pos = (self._ring_pos - 1) % canvas_h
+        row = nearest_resize(self._img_buf[:1], 1, canvas_w)
+        ppm = ('P6\n%d 1\n255\n' % canvas_w).encode('ascii') + row.tobytes()
+        self._photo.tk.call(self._photo.name, 'put', ppm, '-format', 'ppm', '-to', 0, self._ring_pos)
+        self._place_ring()
+
+    def _redraw_overlays(self):
+        """S-meter and frequency axis (the axis only when what it shows changed)."""
         if self._last_signal_dbm is not None:
             self._dbm_var.set('%.0f dBm' % self._last_signal_dbm)
             self._draw_smeter(self._last_signal_dbm, self._smeter_peak_dbm)
@@ -3573,7 +3621,6 @@ class PanadapterApp:
         # Axis sits above the waterfall, so ticks point down toward it (at
         # the strip's bottom edge) with labels above them.
         c = self._freqaxis_canvas
-        c.delete('all')
         # Deliberately self._canvas's width, not c's own -- the waterfall
         # image (and all the drag-pan pixel math in _on_wf_drag/_on_wf_release/
         # _shift_img_buf) is authoritatively sized off self._canvas.winfo_width().
@@ -3586,6 +3633,15 @@ class PanadapterApp:
         # sync.
         w = max(1, self._canvas.winfo_width())
         h = max(1, c.winfo_height())
+        if marker_freq is None:
+            with self._freq_lock:
+                marker_freq = self._current_freq_khz
+        # Redrawn each row before, though it rarely changes (~5% of a Pi 4 core)
+        key = (start_khz, stop_khz, w, h, marker_freq, marker_color, self._pb_lowcut_hz, self._pb_highcut_hz)
+        if key == self._freq_axis_key:
+            return
+        self._freq_axis_key = key
+        c.delete('all')
         span = stop_khz - start_khz
         if span <= 0:
             return
@@ -3602,9 +3658,6 @@ class PanadapterApp:
             c.create_line(x, h, x, h - 6, fill='#a0a0a0', width=2)
             c.create_text(x, h - 7, text=label_fmt % f, fill='white', anchor='s', font=('TkFixedFont', 7))
 
-        if marker_freq is None:
-            with self._freq_lock:
-                marker_freq = self._current_freq_khz
         if marker_freq is not None and start_khz <= marker_freq <= stop_khz:
             x = int((marker_freq - start_khz) / span * w)
             c.create_line(x, 0, x, h, fill=marker_color, width=2)
@@ -3664,7 +3717,8 @@ class PanadapterApp:
         dx = event.x - self._drag_start_x
         self._drag_last_dx = dx
         self._drag_freq_khz = self._drag_start_freq_khz - (dx / canvas_w) * span_khz
-        self._canvas.coords(self._image_id, dx, 0)
+        self._ring_dx = dx
+        self._place_ring()
         self._redraw_freq_axis_only()
 
     def _on_wf_release(self, event):
@@ -3703,7 +3757,7 @@ class PanadapterApp:
                 except Exception as e:
                     logging.debug('failed to save manual_band: %s', e)
             self._set_manual_freq(final_freq)
-        self._canvas.coords(self._image_id, 0, 0)
+        self._ring_dx = 0
         self._redraw()
 
     def _draw_smeter(self, dbm, peak_dbm=None):
