@@ -1512,6 +1512,12 @@ class LiveAudioStream(FailReasonMixin, KiwiSDRStream):
             data = data[:, None]
         if data.shape[1] == 1 and channels != 1:
             data = np.tile(data, [1, channels])
+        elif data.shape[1] > 1 and channels == 1:
+            # a stereo demod mode reaching the mono player: play it as mono
+            if not getattr(self, '_warned_mono', False):
+                logging.warning('stereo audio on a mono player -- mixed to mono')
+                self._warned_mono = True
+            data = np.ascontiguousarray(data.mean(axis=1, keepdims=True))
         while data.nbytes > 0 and self._playback_running:
             nwrite = writable(stream) // (4 * channels)   # float32 samples
             if nwrite == 0:
@@ -1575,8 +1581,11 @@ class LiveAudioStream(FailReasonMixin, KiwiSDRStream):
             # pulseaudio has sporadic failures, retry a few times
             for i in range(0, 10):
                 try:
-                    # Small blocksize to avoid long blocking in play() which delays retunes
-                    self._player = speaker.player(samplerate=rate, blocksize=self._options.blocksize)
+                    # Small blocksize to avoid long blocking in play() which delays retunes.
+                    # Mono except for IQ: demodulated audio is one channel, and
+                    # PipeWire copies it to a stereo sink's two channels itself.
+                    self._player = speaker.player(samplerate=rate, blocksize=self._options.blocksize,
+                                                  channels=2 if self._modulation == 'iq' else 1)
                     self._player.__enter__()
                     break
                 except Exception as ex:
