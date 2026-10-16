@@ -638,7 +638,7 @@ def load_config(path):
             f.write("freq_minor_khz  1\n")
             f.write("window_height   %d\n" % DEFAULT_WINDOW_HEIGHT)
             f.write("modulation      usb\n")
-            f.write("ncomp           false\n")
+            f.write("ncomp           true\n")
             f.write("# sounddevice  name  -- run --ls-snd to list available sound devices\n")
             f.write("\n# Manual tuning (Auto/Manual toggle) -- last state, restored at startup.\n")
             f.write("# Auto and Manual each remember their own last-used Mode combo selection\n")
@@ -1476,13 +1476,46 @@ class LiveAudioStream(FailReasonMixin, KiwiSDRStream):
             except Exception:
                 break
 
+    def _play_paced(self, data):
+        """self._player.play(data), without soundcard's busy wait. Its play()
+        polls for buffer space every 1ms while the server buffer is full -- with
+        the small blocksize that's ~1000 polls a second, each taking
+        PulseAudio's lock through cffi, which measured 19% of a Raspberry Pi 4
+        core. Same write loop, but between polls it waits about a quarter of
+        the buffer's play time. Falls back to play() if soundcard's internals
+        aren't as expected (they're the same in 0.4.4 and 0.4.6)."""
+        player = self._player
+        try:
+            from soundcard import pulseaudio as scpa
+            writable, write = scpa._pulse._pa_stream_writable_size, scpa._pulse._pa_stream_write
+            null, seek = scpa._ffi.NULL, scpa._pa.PA_SEEK_RELATIVE
+            stream, channels = player.stream, player.channels
+            rate, blocksize = player._samplerate, player._blocksize
+        except Exception:
+            player.play(data)
+            return
+        wait = min(0.02, max(0.001, (blocksize or 2048) / 4 / rate))
+        data = np.array(data, dtype='float32', order='C')
+        if data.ndim == 1:
+            data = data[:, None]
+        if data.shape[1] == 1 and channels != 1:
+            data = np.tile(data, [1, channels])
+        while data.nbytes > 0 and self._playback_running:
+            nwrite = writable(stream) // (4 * channels)   # float32 samples
+            if nwrite == 0:
+                time.sleep(wait)
+                continue
+            chunk = data[:nwrite].ravel().tobytes()
+            write(stream, chunk, len(chunk), null, 0, seek)
+            data = data[nwrite:]
+
     def _playback_thread_func(self):
         """Separate thread for audio playback to avoid blocking rigctl retuning."""
         while self._playback_running:
             try:
                 samples = self._audio_queue.get(timeout=0.1)
                 if samples is not None:
-                    self._player.play(samples)
+                    self._play_paced(samples)
             except Empty:
                 continue
             except Exception as e:
@@ -3855,10 +3888,13 @@ def parse_args():
                          'instead of FreeDV\'s decoded RX audio -- see the SPK button; the headset '
                          'device itself is read from ~/freedv-links, not configured here '
                          '(config: spk_direct, default false)')
+    # Uncompressed by default: decoding the Kiwi's ADPCM audio sample by sample
+    # in Python took 11% of a Raspberry Pi 4 core, for 24kB/s instead of 6kB/s
     p.add_argument('--ncomp', '--no-compression', dest='ncomp', action='store_true',
-                    default=cfg.get('ncomp', False),
+                    default=cfg.get('ncomp', True),
                     help="don't use audio compression -- better quality for a data-mode decoder like FreeDV, "
-                         "at the cost of ~2x audio bandwidth to the Kiwi (config: ncomp, default false)")
+                         "and much less CPU, at the cost of ~4x audio bandwidth from the Kiwi (24kB/s) "
+                         "(config: ncomp, default true; set ncomp false to use compression)")
     p.add_argument('-L', '--lp-cut', dest='lp_cut', type=float, default=cfg.get('lp_cut', None),
                     help='low-pass cutoff frequency, in Hz -- overridden by any live rigctl mode/passband '
                          'update once one arrives (config: lp_cut)')
