@@ -48,10 +48,15 @@ case ${FREEDV_RADE:-} in
     V1) args+=(--auto-mode FDV1) ;;
 esac
 # rigctld as set up for the radio (FREEDV_RIG_HOST, host:port), on this
-# computer or another one, so panadapter.conf needn't say where it is
+# computer or another one -- only where panadapter.conf doesn't say itself:
+# a rigctl_host or rigctl_port set there always wins (another rig server,
+# another port)
+conf="$KIWI_DIR/panadapter.conf"
 if [[ -n ${FREEDV_RIG_HOST:-} ]]; then
-    args+=(--rigctl-host "${FREEDV_RIG_HOST%:*}")
-    [[ $FREEDV_RIG_HOST == *:* ]] && args+=(--rigctl-port "${FREEDV_RIG_HOST##*:}")
+    grep -qE '^rigctl_host[[:space:]]' "$conf" 2>/dev/null \
+        || args+=(--rigctl-host "${FREEDV_RIG_HOST%:*}")
+    [[ $FREEDV_RIG_HOST == *:* ]] && ! grep -qE '^rigctl_port[[:space:]]' "$conf" 2>/dev/null \
+        && args+=(--rigctl-port "${FREEDV_RIG_HOST##*:}")
 fi
 
 echo "Starting panadapter"

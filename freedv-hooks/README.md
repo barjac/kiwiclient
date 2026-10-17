@@ -30,8 +30,9 @@ and a `git pull` here then updates them.
   otherwise (needs freedv-rade-setup from 17 Oct 2026 or later, whose start
   script sets `FREEDV_RADE`; with an older one the saved choice is used).
   Likewise the panadapter uses the rigctld chosen in the radio's setup (on
-  the Pi itself or another computer: `FREEDV_RIG_HOST`), so `panadapter.conf`
-  needs no `rigctl_host`/`rigctl_port`.
+  the Pi itself or another computer: `FREEDV_RIG_HOST`) for whatever
+  `panadapter.conf` leaves out: a `rigctl_host` or `rigctl_port` set there
+  always wins (e.g. another rig server or port).
 - `after-freedv` stops it.
 - `env` runs FreeDV under X11 (`GDK_BACKEND=x11`): the panadapter finds the
   Reporter window (`snap_below_title`) with X11 tools, which can't see a
