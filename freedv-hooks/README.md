@@ -29,10 +29,11 @@ and a `git pull` here then updates them.
   passband preset follows the FreeDV build: FDV2 for a RADE V2 build, FDV1
   otherwise (needs freedv-rade-setup from 17 Oct 2026 or later, whose start
   script sets `FREEDV_RADE`; with an older one the saved choice is used).
-  Likewise the panadapter uses the rigctld chosen in the radio's setup (on
-  the Pi itself or another computer: `FREEDV_RIG_HOST`) for whatever
-  `panadapter.conf` leaves out: a `rigctl_host` or `rigctl_port` set there
-  always wins (e.g. another rig server or port).
+  Likewise the panadapter follows FreeDV's own rig control setting: when
+  FreeDV uses a rigctl server ("Hamlib NET rigctl", here or on another
+  computer, any port), the panadapter uses the same address (the start
+  script names FreeDV's settings file in `FREEDV_CONF`). When FreeDV drives
+  the radio itself, `panadapter.conf`'s `rigctl_host`/`rigctl_port` are used.
 - `after-freedv` stops it.
 - `env` runs FreeDV under X11 (`GDK_BACKEND=x11`): the panadapter finds the
   Reporter window (`snap_below_title`) with X11 tools, which can't see a
