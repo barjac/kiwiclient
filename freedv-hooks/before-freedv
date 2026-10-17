@@ -47,6 +47,12 @@ case ${FREEDV_RADE:-} in
     V2) args+=(--auto-mode FDV2) ;;
     V1) args+=(--auto-mode FDV1) ;;
 esac
+# rigctld as set up for the radio (FREEDV_RIG_HOST, host:port), on this
+# computer or another one, so panadapter.conf needn't say where it is
+if [[ -n ${FREEDV_RIG_HOST:-} ]]; then
+    args+=(--rigctl-host "${FREEDV_RIG_HOST%:*}")
+    [[ $FREEDV_RIG_HOST == *:* ]] && args+=(--rigctl-port "${FREEDV_RIG_HOST##*:}")
+fi
 
 echo "Starting panadapter"
 # 9>&- : don't hold the start script's lock (see freedv-rade-setup)
