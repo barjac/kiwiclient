@@ -1035,6 +1035,9 @@ class RigctlPoller(threading.Thread):
         self._poll_interval = poll_interval
         self._stop_event = threading.Event()
         self._recv_buf = ''
+        # time.time() of the last successful poll -- kept even in Manual,
+        # where the frequency itself is ignored, so QSY knows rigctld answers.
+        self.last_ok_ts = None
 
     def stop(self):
         self._stop_event.set()
@@ -1061,6 +1064,7 @@ class RigctlPoller(threading.Thread):
                     sock.settimeout(2)
                 sock.sendall(b'f\n')
                 freq_hz = float(self._read_line(sock))
+                self.last_ok_ts = time.time()
                 self._on_freq_khz(freq_hz / 1000.0)
 
                 if self._on_mode is not None:
@@ -1088,6 +1092,37 @@ class RigctlPoller(threading.Thread):
                 sock.close()
             except Exception:
                 pass
+
+
+def rigctl_qsy(host, port, freq_hz):
+    """Tunes the rig behind rigctld to freq_hz (frequency only -- FreeDV owns
+    the mode), refusing while it is transmitting. Returns (ok, short reason)."""
+    try:
+        with socket.create_connection((host, port), timeout=2) as sock:
+            sock.settimeout(2)
+            buf = ''
+
+            def reply():
+                nonlocal buf
+                while '\n' not in buf:
+                    chunk = sock.recv(256)
+                    if not chunk:
+                        raise ConnectionError('rigctld connection closed')
+                    buf += chunk.decode('ascii', errors='ignore')
+                line, buf = buf.split('\n', 1)
+                return line.strip()
+
+            sock.sendall(b't\n')
+            if reply() == '1':
+                return False, 'TX on'
+            sock.sendall(b'F %d\n' % freq_hz)
+            answer = reply()
+            if answer == 'RPRT 0':
+                return True, ''
+            return False, answer
+    except Exception as e:
+        logging.warning('QSY to %d Hz failed: %s', freq_hz, e)
+        return False, 'no rig'
 
 
 def describe_connect_failure(e):
@@ -2008,6 +2043,11 @@ class PanadapterApp:
         # detect a stale/dead rig link for the "No rig data" readout warning
         # in _poll_queue; not used for anything retune-related.
         self._last_rig_update_ts = None
+        self._qsy_busy = False
+        self._qsy_result = None      # (ok, reason) from the QSY thread, for _poll_queue
+        self._status_text = ''       # last _set_status text; a QSY message can cover it briefly
+        self._status_msg = None
+        self._status_msg_until = 0.0
         self._freq_lock = threading.Lock()
         self._row_queue = queue.Queue(maxsize=2)
         self._img_buf = np.zeros((MAX_HISTORY_ROWS, WF_NATIVE_BINS, 3), dtype=np.uint8)
@@ -2383,6 +2423,12 @@ class PanadapterApp:
         _Tooltip(self._auto_btn, lambda: 'Click to switch to %s' % (
             'Auto' if self._auto_btn_var.get() == 'Manual' else 'Manual'))
 
+        # Manual only: tune the radio to the Manual frequency (FreeDV's
+        # frequency box follows the radio), then back to Auto.
+        self._qsy_btn = tk.Button(top, text='QSY', padx=2, pady=1, state='disabled', command=self._qsy)
+        self._qsy_btn.pack(side='left', padx=1)
+        _Tooltip(self._qsy_btn, self._qsy_tooltip)
+
         self._rx_source_var = tk.StringVar(value=self._rx_source)
         self._rx_source_btn = ttk.Button(top, textvariable=self._rx_source_var, command=self._toggle_rx_source,
                                           width=4,
@@ -2602,8 +2648,8 @@ class PanadapterApp:
         """Sets the status text and its background -- green for 'Connected'
         (actually streaming data), amber for everything else (Connecting/
         Disconnecting/Stopped)."""
-        self._status_var.set(text)
-        self._status_label.configure(style=('StatusGreen.TLabel' if text == 'Connected' else 'StatusAmber.TLabel'))
+        self._status_text = text
+        self._show_status()
         # Whether a connection is actually live (data arriving), so switching
         # SDR or stopping only says "Disconnecting" when there is something
         # to disconnect from -- not while an attempt is still failing.
@@ -2611,6 +2657,52 @@ class PanadapterApp:
             self._is_connected = True
         elif text not in ('Disconnecting',):
             self._is_connected = False
+
+    def _show_status(self):
+        if self._status_msg is not None and time.time() < self._status_msg_until:
+            self._status_var.set(self._status_msg)
+            self._status_label.configure(style='StatusAmber.TLabel')
+            return
+        self._status_msg = None
+        text = self._status_text
+        self._status_var.set(text)
+        self._status_label.configure(style=('StatusGreen.TLabel' if text == 'Connected' else 'StatusAmber.TLabel'))
+
+    def _rig_answering(self):
+        ts = self._rigctl_poller.last_ok_ts
+        return ts is not None and time.time() - ts <= RIG_STALE_TIMEOUT_SEC
+
+    def _qsy_tooltip(self):
+        if not self._manual:
+            return 'QSY: Manual only'
+        if not self._rig_answering():
+            return 'QSY: rigctld is not answering'
+        return 'Tune the radio to %.3f kHz, then back to Auto' % self._manual_freq_khz
+
+    def _qsy(self):
+        if self._qsy_busy or not self._manual:
+            return
+        self._qsy_busy = True
+        self._qsy_btn.config(state='disabled')
+        freq_hz = int(round(self._manual_freq_khz * 1000))
+        host, port = self._options.rigctl_host, self._options.rigctl_port
+
+        def worker():
+            self._qsy_result = rigctl_qsy(host, port, freq_hz)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_qsy(self, ok, reason):
+        self._qsy_busy = False
+        if ok:
+            # The rig is now where Manual is, so Auto takes over without a jump.
+            self._last_rig_update_ts = time.time()
+            if self._manual:
+                self._toggle_auto_manual()
+            return
+        logging.warning('QSY refused: %s', reason)
+        self._status_msg = ('QSY: %s' % reason)[:14]
+        self._status_msg_until = time.time() + 4.0
+        self._show_status()
 
     def _start_stream(self, sdr_entry):
         # Set/flush this first, before any of the blocking connection setup
@@ -3365,6 +3457,14 @@ class PanadapterApp:
                 self._last_rig_update_ts is None
                 or time.time() - self._last_rig_update_ts > RIG_STALE_TIMEOUT_SEC):
             self._freq_var.set('No rig data')
+
+        result, self._qsy_result = self._qsy_result, None
+        if result is not None:
+            self._finish_qsy(*result)
+        if self._status_msg is not None and time.time() >= self._status_msg_until:
+            self._show_status()
+        if not self._qsy_busy:
+            self._qsy_btn.config(state=('normal' if self._manual and self._rig_answering() else 'disabled'))
 
         self._root.after(150, self._poll_queue)
 
