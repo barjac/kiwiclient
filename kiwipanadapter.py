@@ -641,9 +641,8 @@ def load_config(path):
             f.write("ncomp           true\n")
             f.write("# sounddevice  name  -- run --ls-snd to list available sound devices\n")
             f.write("\n# Manual tuning (Auto/Manual toggle) -- last state, restored at startup.\n")
-            f.write("# Auto and Manual each remember their own last-used Mode combo selection\n")
-            f.write("# separately (auto_mode/manual_mode) -- switching between them, or\n")
-            f.write("# restarting, always resumes each one right where it was left.\n")
+            f.write("# Auto and Manual each remember their own Mode combo selection\n")
+            f.write("# (auto_mode/manual_mode); switching to Manual starts it from Auto's Mode.\n")
             f.write("manual_active   false\n")
             f.write("manual_freq_khz %s\n" % BAND_DEFAULT_KHZ['40m'])
             f.write("manual_band     40m\n")
@@ -3135,6 +3134,13 @@ class PanadapterApp:
                     save_config_value(self._options.config, 'manual_freq_khz', current_freq)
                 except Exception as e:
                     logging.debug('failed to save manual_freq_khz: %s', e)
+            # Carry Auto's Mode too, so the passband marker keeps FreeDV's
+            # width (FDV1/FDV2) while looking for a clear spot to QSY to.
+            self._manual_mode = self._auto_mode
+            try:
+                save_config_value(self._options.config, 'manual_mode', self._manual_mode)
+            except Exception as e:
+                logging.debug('failed to save manual_mode: %s', e)
             self._manual = True
             self._auto_btn_var.set('Manual')
             self._mode_var.set(self._manual_mode)
